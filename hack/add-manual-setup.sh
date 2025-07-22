@@ -35,7 +35,7 @@ awk '
 # Replace the original file with the temp file to maintain consistent line endings
 mv "$TEMP_FILE" "$SETUP_FILE"
 
-# Restore original permissions
-chmod "$ORIGINAL_PERMS" "$SETUP_FILE" 2>/dev/null || true
+# Ensure consistent file permissions (644 - readable/writable by owner, readable by group/others)
+chmod 644 "$SETUP_FILE"
 
 echo "Manual controller setup added to zz_setup.go"
