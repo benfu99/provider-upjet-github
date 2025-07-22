@@ -61,17 +61,20 @@ UPTEST_VERSION = v0.11.1
 # ====================================================================================
 # Setup Images
 
-REGISTRY_ORGS ?= xpkg.upbound.io/crossplane-contrib
+# Default to crossplane-contrib, but allow override via REGISTRY_ORG environment variable
+REGISTRY_ORG ?= crossplane-contrib
+REGISTRY_ORGS ?= ghcr.io/$(REGISTRY_ORG)
 IMAGES = $(PROJECT_NAME)
 -include build/makelib/imagelight.mk
 
 # ====================================================================================
 # Setup XPKG
 
-XPKG_REG_ORGS ?= xpkg.upbound.io/crossplane-contrib
-# NOTE(hasheddan): skip promoting on xpkg.upbound.io as channel tags are
+# Default to crossplane-contrib, but allow override via REGISTRY_ORG environment variable
+XPKG_REG_ORGS ?= ghcr.io/$(REGISTRY_ORG)
+# NOTE(hasheddan): skip promoting on ghcr.io as channel tags are
 # inferred.
-XPKG_REG_ORGS_NO_PROMOTE ?= xpkg.upbound.io/crossplane-contrib
+XPKG_REG_ORGS_NO_PROMOTE ?= ghcr.io/$(REGISTRY_ORG)
 XPKGS = $(PROJECT_NAME)
 -include build/makelib/xpkg.mk
 

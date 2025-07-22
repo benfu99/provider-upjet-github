@@ -1,0 +1,44 @@
+apiVersion: enterprise.github.upbound.io/v1alpha1
+kind: CostCenter
+metadata:
+  annotations:
+    meta.upbound.io/example-id: enterprise/v1alpha1/costcenter
+  labels:
+    testing.upbound.io/example-name: test-costcenter-basic
+  name: test-costcenter-basic
+spec:
+  forProvider:
+    enterprise: lhg
+    name: "Test Cost Center Basic"
+  providerConfigRef:
+    name: default
+---
+apiVersion: enterprise.github.upbound.io/v1alpha1
+kind: CostCenter
+metadata:
+  annotations:
+    meta.upbound.io/example-id: enterprise/v1alpha1/costcenter-custom
+  labels:
+    testing.upbound.io/example-name: test-costcenter-custom
+  name: test-costcenter-custom
+spec:
+  forProvider:
+    enterprise: lhg
+    name: "Development Team Cost Center"
+  providerConfigRef:
+    name: default
+---
+apiVersion: enterprise.github.upbound.io/v1alpha1
+kind: CostCenter
+metadata:
+  annotations:
+    meta.upbound.io/example-id: enterprise/v1alpha1/costcenter-production
+  labels:
+    testing.upbound.io/example-name: test-costcenter-production
+  name: test-costcenter-production
+spec:
+  forProvider:
+    enterprise: lhg
+    name: "Production Infrastructure"
+  providerConfigRef:
+    name: default
