@@ -30,6 +30,9 @@ Copyright 2021 Upbound Inc.
 // Generate crossplane-runtime methodsets (resource.Claim, etc)
 //go:generate go run -tags generate github.com/crossplane/crossplane-tools/cmd/angryjet generate-methodsets --header-file=../hack/boilerplate.go.txt ./...
 
+// Add manual controller setup to generated files
+//go:generate bash -c "cd .. && bash hack/add-manual-setup.sh"
+
 package apis
 
 import (

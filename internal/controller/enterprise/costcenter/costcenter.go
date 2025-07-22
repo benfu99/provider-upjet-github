@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -42,6 +43,8 @@ const (
 // Setup adds a controller that reconciles CostCenter managed resources.
 func Setup(mgr ctrl.Manager, o controller.Options) error {
 	name := managed.ControllerName(v1alpha1.CostCenterGroupVersionKind.String())
+
+	fmt.Printf("Setting up CostCenter controller: %s\n", name)
 
 	cps := []managed.ConnectionPublisher{managed.NewAPISecretPublisher(mgr.GetClient(), mgr.GetScheme())}
 
@@ -184,7 +187,7 @@ func (s *gitHubService) makeRequest(ctx context.Context, method, path string, bo
 		reqBody = &bytes.Buffer{}
 	}
 
-	url := fmt.Sprintf("%s/%s", s.baseURL, path)
+	url := fmt.Sprintf("%s/%s", strings.TrimRight(s.baseURL, "/"), path)
 
 	// Add debug logging (you can see this in controller logs)
 	fmt.Printf("Making %s request to: %s\n", method, url)
