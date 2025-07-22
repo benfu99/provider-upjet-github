@@ -254,8 +254,18 @@ func (s *gitHubService) CreateCostCenter(ctx context.Context, enterprise, name s
 		return nil, fmt.Errorf("failed to decode response: %w - Response: %s", err, string(bodyBytes))
 	}
 
-	// Debug: log the parsed cost center
-	fmt.Printf("Parsed cost center - ID: %v, Name: %v, State: %v\n", costCenter.ID, costCenter.Name, costCenter.State)
+	// Debug: log the parsed cost center (dereference pointers to show actual values)
+	var id, nameVal, state string
+	if costCenter.ID != nil {
+		id = *costCenter.ID
+	}
+	if costCenter.Name != nil {
+		nameVal = *costCenter.Name
+	}
+	if costCenter.State != nil {
+		state = *costCenter.State
+	}
+	fmt.Printf("Parsed cost center - ID: %s, Name: %s, State: %s\n", id, nameVal, state)
 
 	return &costCenter, nil
 }
@@ -283,6 +293,9 @@ func (s *gitHubService) GetCostCenter(ctx context.Context, enterprise, costCente
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API error: %d %s - Response: %s", resp.StatusCode, resp.Status, string(bodyBytes))
 	}
+
+	// Debug: log the response for troubleshooting
+	fmt.Printf("GetCostCenter response body: %s\n", string(bodyBytes))
 
 	// The API returns an array with one element
 	var costCenters []CostCenter
@@ -317,12 +330,20 @@ func (s *gitHubService) ListCostCenters(ctx context.Context, enterprise string) 
 		return nil, fmt.Errorf("GitHub API error: %d %s - Response: %s", resp.StatusCode, resp.Status, string(bodyBytes))
 	}
 
-	var costCenters []CostCenter
-	if err := json.Unmarshal(bodyBytes, &costCenters); err != nil {
+	// Debug: log the response for troubleshooting
+	fmt.Printf("ListCostCenters response body: %s\n", string(bodyBytes))
+
+	// The API returns a wrapper object with a "costCenters" field
+	type ListResponse struct {
+		CostCenters []CostCenter `json:"costCenters"`
+	}
+
+	var response ListResponse
+	if err := json.Unmarshal(bodyBytes, &response); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w - Response: %s", err, string(bodyBytes))
 	}
 
-	return costCenters, nil
+	return response.CostCenters, nil
 }
 
 func (s *gitHubService) UpdateCostCenter(ctx context.Context, enterprise, costCenterID, name string) (*CostCenter, error) {
@@ -346,10 +367,19 @@ func (s *gitHubService) UpdateCostCenter(ctx context.Context, enterprise, costCe
 		return nil, fmt.Errorf("GitHub API error: %d", resp.StatusCode)
 	}
 
+	// Read response body for flexible parsing
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Debug: log the response for troubleshooting
+	fmt.Printf("UpdateCostCenter response body: %s\n", string(bodyBytes))
+
 	// The API returns an array with one element
 	var costCenters []CostCenter
-	if err := json.NewDecoder(resp.Body).Decode(&costCenters); err != nil {
-		return nil, err
+	if err := json.Unmarshal(bodyBytes, &costCenters); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w - Response: %s", err, string(bodyBytes))
 	}
 
 	if len(costCenters) == 0 {
@@ -479,21 +509,48 @@ func (c *external) handleExistingCostCenter(ctx context.Context, cr *v1alpha1.Co
 	}
 
 	// Find the cost center with matching name
+	// Prefer active cost centers over deleted ones
+	var matchingCostCenter *CostCenter
 	for _, cc := range costCenters {
 		if cc.Name != nil && *cc.Name == name {
-			log.Info("Found existing cost center", "id", cc.ID, "name", cc.Name, "state", cc.State)
-			c.recorder.Event(cr, event.Normal("Found", "Found existing cost center in GitHub"))
-
-			// Update the status with the existing cost center's ID
-			cr.Status.AtProvider.ID = cc.ID
-			cr.Status.AtProvider.Name = cc.Name
-			cr.Status.AtProvider.State = cc.State
-
-			// Debug: verify the ID was set
-			fmt.Printf("Set existing cost center ID in status: %v\n", cr.Status.AtProvider.ID)
-
-			return managed.ExternalCreation{}, nil
+			// If we haven't found one yet, or if this one is active and our current match isn't
+			if matchingCostCenter == nil ||
+				(cc.State != nil && *cc.State == "active" &&
+					(matchingCostCenter.State == nil || *matchingCostCenter.State != "active")) {
+				ccCopy := cc // Make a copy to avoid pointer issues
+				matchingCostCenter = &ccCopy
+			}
 		}
+	}
+
+	if matchingCostCenter != nil {
+		// Helper function to safely get string value from pointer
+		getValue := func(ptr *string) string {
+			if ptr != nil {
+				return *ptr
+			}
+			return ""
+		}
+
+		log.Info("Found existing cost center",
+			"id", getValue(matchingCostCenter.ID),
+			"name", getValue(matchingCostCenter.Name),
+			"state", getValue(matchingCostCenter.State))
+		c.recorder.Event(cr, event.Normal("Found", "Found existing cost center in GitHub"))
+
+		// Update the status with the existing cost center's ID
+		cr.Status.AtProvider.ID = matchingCostCenter.ID
+		cr.Status.AtProvider.Name = matchingCostCenter.Name
+		cr.Status.AtProvider.State = matchingCostCenter.State
+
+		// Debug: verify the ID was set (dereference pointer to show actual value)
+		var statusID string
+		if cr.Status.AtProvider.ID != nil {
+			statusID = *cr.Status.AtProvider.ID
+		}
+		fmt.Printf("Set existing cost center ID in status: %s\n", statusID)
+
+		return managed.ExternalCreation{}, nil
 	}
 
 	// If we get here, we couldn't find the cost center despite the 409 error
@@ -534,7 +591,18 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalCreation{}, errors.Wrap(err, errCreateCostCenter)
 	}
 
-	log.Info("Successfully created cost center", "id", costCenter.ID, "name", costCenter.Name, "state", costCenter.State)
+	// Helper function to safely get string value from pointer
+	getValue := func(ptr *string) string {
+		if ptr != nil {
+			return *ptr
+		}
+		return ""
+	}
+
+	log.Info("Successfully created cost center",
+		"id", getValue(costCenter.ID),
+		"name", getValue(costCenter.Name),
+		"state", getValue(costCenter.State))
 	c.recorder.Event(cr, event.Normal("Created", "Successfully created cost center in GitHub"))
 
 	// Update the status with the new ID
@@ -542,8 +610,12 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	cr.Status.AtProvider.Name = costCenter.Name
 	cr.Status.AtProvider.State = costCenter.State
 
-	// Debug: verify the ID was set
-	fmt.Printf("Set cost center ID in status: %v\n", cr.Status.AtProvider.ID)
+	// Debug: verify the ID was set (dereference pointer to show actual value)
+	var statusID string
+	if cr.Status.AtProvider.ID != nil {
+		statusID = *cr.Status.AtProvider.ID
+	}
+	fmt.Printf("Set cost center ID in status: %s\n", statusID)
 
 	return managed.ExternalCreation{}, nil
 }
