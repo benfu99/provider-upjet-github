@@ -495,6 +495,54 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}, nil
 }
 
+// findBestMatchingCostCenter finds the best matching cost center by name, preferring active ones
+func findBestMatchingCostCenter(costCenters []CostCenter, name string) *CostCenter {
+	var matchingCostCenter *CostCenter
+	for _, cc := range costCenters {
+		if cc.Name != nil && *cc.Name == name {
+			// If we haven't found one yet, or if this one is active and our current match isn't
+			if matchingCostCenter == nil ||
+				(cc.State != nil && *cc.State == "active" &&
+					(matchingCostCenter.State == nil || *matchingCostCenter.State != "active")) {
+				ccCopy := cc // Make a copy to avoid pointer issues
+				matchingCostCenter = &ccCopy
+			}
+		}
+	}
+	return matchingCostCenter
+}
+
+// updateStatusWithCostCenter updates the CostCenter status with the provided cost center data
+func (c *external) updateStatusWithCostCenter(ctx context.Context, cr *v1alpha1.CostCenter, costCenter *CostCenter) {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Helper function to safely get string value from pointer
+	getValue := func(ptr *string) string {
+		if ptr != nil {
+			return *ptr
+		}
+		return ""
+	}
+
+	log.Info("Found existing cost center",
+		"id", getValue(costCenter.ID),
+		"name", getValue(costCenter.Name),
+		"state", getValue(costCenter.State))
+	c.recorder.Event(cr, event.Normal("Found", "Found existing cost center in GitHub"))
+
+	// Update the status with the existing cost center's ID
+	cr.Status.AtProvider.ID = costCenter.ID
+	cr.Status.AtProvider.Name = costCenter.Name
+	cr.Status.AtProvider.State = costCenter.State
+
+	// Debug: verify the ID was set (dereference pointer to show actual value)
+	var statusID string
+	if cr.Status.AtProvider.ID != nil {
+		statusID = *cr.Status.AtProvider.ID
+	}
+	fmt.Printf("Set existing cost center ID in status: %s\n", statusID)
+}
+
 // handleExistingCostCenter handles the case where a cost center already exists (409 conflict)
 func (c *external) handleExistingCostCenter(ctx context.Context, cr *v1alpha1.CostCenter, enterprise, name string, originalErr error) (managed.ExternalCreation, error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("function", "handleExistingCostCenter")
@@ -508,48 +556,10 @@ func (c *external) handleExistingCostCenter(ctx context.Context, cr *v1alpha1.Co
 		return managed.ExternalCreation{}, errors.Wrap(listErr, errCreateCostCenter)
 	}
 
-	// Find the cost center with matching name
-	// Prefer active cost centers over deleted ones
-	var matchingCostCenter *CostCenter
-	for _, cc := range costCenters {
-		if cc.Name != nil && *cc.Name == name {
-			// If we haven't found one yet, or if this one is active and our current match isn't
-			if matchingCostCenter == nil ||
-				(cc.State != nil && *cc.State == "active" &&
-					(matchingCostCenter.State == nil || *matchingCostCenter.State != "active")) {
-				ccCopy := cc // Make a copy to avoid pointer issues
-				matchingCostCenter = &ccCopy
-			}
-		}
-	}
-
+	// Find the best matching cost center (preferring active ones)
+	matchingCostCenter := findBestMatchingCostCenter(costCenters, name)
 	if matchingCostCenter != nil {
-		// Helper function to safely get string value from pointer
-		getValue := func(ptr *string) string {
-			if ptr != nil {
-				return *ptr
-			}
-			return ""
-		}
-
-		log.Info("Found existing cost center",
-			"id", getValue(matchingCostCenter.ID),
-			"name", getValue(matchingCostCenter.Name),
-			"state", getValue(matchingCostCenter.State))
-		c.recorder.Event(cr, event.Normal("Found", "Found existing cost center in GitHub"))
-
-		// Update the status with the existing cost center's ID
-		cr.Status.AtProvider.ID = matchingCostCenter.ID
-		cr.Status.AtProvider.Name = matchingCostCenter.Name
-		cr.Status.AtProvider.State = matchingCostCenter.State
-
-		// Debug: verify the ID was set (dereference pointer to show actual value)
-		var statusID string
-		if cr.Status.AtProvider.ID != nil {
-			statusID = *cr.Status.AtProvider.ID
-		}
-		fmt.Printf("Set existing cost center ID in status: %s\n", statusID)
-
+		c.updateStatusWithCostCenter(ctx, cr, matchingCostCenter)
 		return managed.ExternalCreation{}, nil
 	}
 
