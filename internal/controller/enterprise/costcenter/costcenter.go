@@ -465,6 +465,43 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}, nil
 }
 
+// handleExistingCostCenter handles the case where a cost center already exists (409 conflict)
+func (c *external) handleExistingCostCenter(ctx context.Context, cr *v1alpha1.CostCenter, enterprise, name string, originalErr error) (managed.ExternalCreation, error) {
+	log := ctrl.LoggerFrom(ctx).WithValues("function", "handleExistingCostCenter")
+	log.Info("Cost center already exists, attempting to find it", "enterprise", enterprise, "name", name)
+
+	// List all cost centers and find the one with matching name
+	costCenters, listErr := c.service.ListCostCenters(ctx, enterprise)
+	if listErr != nil {
+		log.Error(listErr, "Failed to list cost centers")
+		c.recorder.Event(cr, event.Warning("CreateFailed", fmt.Errorf("cost center exists but failed to find it: %w", listErr)))
+		return managed.ExternalCreation{}, errors.Wrap(listErr, errCreateCostCenter)
+	}
+
+	// Find the cost center with matching name
+	for _, cc := range costCenters {
+		if cc.Name != nil && *cc.Name == name {
+			log.Info("Found existing cost center", "id", cc.ID, "name", cc.Name, "state", cc.State)
+			c.recorder.Event(cr, event.Normal("Found", "Found existing cost center in GitHub"))
+
+			// Update the status with the existing cost center's ID
+			cr.Status.AtProvider.ID = cc.ID
+			cr.Status.AtProvider.Name = cc.Name
+			cr.Status.AtProvider.State = cc.State
+
+			// Debug: verify the ID was set
+			fmt.Printf("Set existing cost center ID in status: %v\n", cr.Status.AtProvider.ID)
+
+			return managed.ExternalCreation{}, nil
+		}
+	}
+
+	// If we get here, we couldn't find the cost center despite the 409 error
+	log.Error(originalErr, "Cost center exists but could not find it in list")
+	c.recorder.Event(cr, event.Warning("CreateFailed", fmt.Errorf("cost center exists but not found in list: %w", originalErr)))
+	return managed.ExternalCreation{}, errors.Wrap(originalErr, errCreateCostCenter)
+}
+
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
 	cr, ok := mg.(*v1alpha1.CostCenter)
 	if !ok {
@@ -489,41 +526,11 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	if err != nil {
 		// Check if it's a 409 conflict (cost center already exists)
 		if strings.Contains(err.Error(), "409") && strings.Contains(err.Error(), "already exists") {
-			log.Info("Cost center already exists, attempting to find it", "enterprise", *enterprise, "name", *name)
-
-			// List all cost centers and find the one with matching name
-			costCenters, listErr := c.service.ListCostCenters(ctx, *enterprise)
-			if listErr != nil {
-				log.Error(listErr, "Failed to list cost centers")
-				c.recorder.Event(cr, event.Warning("CreateFailed", fmt.Errorf("cost center exists but failed to find it: %w", listErr)))
-				return managed.ExternalCreation{}, errors.Wrap(listErr, errCreateCostCenter)
-			}
-
-			// Find the cost center with matching name
-			for _, cc := range costCenters {
-				if cc.Name != nil && *cc.Name == *name {
-					log.Info("Found existing cost center", "id", cc.ID, "name", cc.Name, "state", cc.State)
-					c.recorder.Event(cr, event.Normal("Found", "Found existing cost center in GitHub"))
-
-					// Update the status with the existing cost center's ID
-					cr.Status.AtProvider.ID = cc.ID
-					cr.Status.AtProvider.Name = cc.Name
-					cr.Status.AtProvider.State = cc.State
-
-					// Debug: verify the ID was set
-					fmt.Printf("Set existing cost center ID in status: %v\n", cr.Status.AtProvider.ID)
-
-					return managed.ExternalCreation{}, nil
-				}
-			}
-
-			// If we get here, we couldn't find the cost center despite the 409 error
-			log.Error(err, "Cost center exists but could not find it in list")
-			c.recorder.Event(cr, event.Warning("CreateFailed", fmt.Errorf("cost center exists but not found in list: %w", err)))
-		} else {
-			log.Error(err, "Failed to create cost center in GitHub API")
-			c.recorder.Event(cr, event.Warning("CreateFailed", err))
+			return c.handleExistingCostCenter(ctx, cr, *enterprise, *name, err)
 		}
+
+		log.Error(err, "Failed to create cost center in GitHub API")
+		c.recorder.Event(cr, event.Warning("CreateFailed", err))
 		return managed.ExternalCreation{}, errors.Wrap(err, errCreateCostCenter)
 	}
 
