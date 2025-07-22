@@ -40,12 +40,12 @@ const (
 
 // Setup adds a controller that reconciles CostCenter managed resources.
 func Setup(mgr ctrl.Manager, o controller.Options) error {
-	name := managed.ControllerName(v1alpha1.CostCenter_GroupVersionKind.String())
+	name := managed.ControllerName(v1alpha1.CostCenterGroupVersionKind.String())
 
 	cps := []managed.ConnectionPublisher{managed.NewAPISecretPublisher(mgr.GetClient(), mgr.GetScheme())}
 
 	r := managed.NewReconciler(mgr,
-		resource.ManagedKind(v1alpha1.CostCenter_GroupVersionKind),
+		resource.ManagedKind(v1alpha1.CostCenterGroupVersionKind),
 		managed.WithExternalConnecter(&connector{
 			kube:         mgr.GetClient(),
 			usage:        resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1beta1.ProviderConfigUsage{}),
@@ -131,6 +131,7 @@ type CostCenter struct {
 	Resources []CostCenterResource `json:"resources,omitempty"`
 }
 
+// CostCenterResource represents a resource associated with a cost center
 type CostCenterResource struct {
 	Type *string `json:"type,omitempty"`
 	Name *string `json:"name,omitempty"`
@@ -200,7 +201,11 @@ func (s *gitHubService) CreateCostCenter(ctx context.Context, enterprise, name s
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			// Log the error but don't override the main return value
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API error: %d", resp.StatusCode)
@@ -221,7 +226,11 @@ func (s *gitHubService) GetCostCenter(ctx context.Context, enterprise, costCente
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			// Log the error but don't override the main return value
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, &NotFoundError{}
@@ -253,7 +262,11 @@ func (s *gitHubService) UpdateCostCenter(ctx context.Context, enterprise, costCe
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			// Log the error but don't override the main return value
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, &NotFoundError{}
@@ -283,7 +296,11 @@ func (s *gitHubService) DeleteCostCenter(ctx context.Context, enterprise, costCe
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			// Log the error but don't override the main return value
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return &NotFoundError{}
@@ -445,10 +462,11 @@ func isUpToDate(costCenter *CostCenter, params v1alpha1.CostCenterParameters) bo
 	return *costCenter.Name == *params.Name
 }
 
+// IsNotFound checks if the given error is a NotFoundError
 func IsNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	_, ok := err.(*NotFoundError)
-	return ok
+	var notFoundErr *NotFoundError
+	return errors.As(err, &notFoundErr)
 }

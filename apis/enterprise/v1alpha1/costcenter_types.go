@@ -108,10 +108,10 @@ type CostCenterList struct {
 
 // Repository type metadata.
 var (
-	CostCenter_Kind             = "CostCenter"
-	CostCenter_GroupKind        = schema.GroupKind{Group: CRDGroup, Kind: CostCenter_Kind}.String()
-	CostCenter_KindAPIVersion   = CostCenter_Kind + "." + CRDGroupVersion.String()
-	CostCenter_GroupVersionKind = CRDGroupVersion.WithKind(CostCenter_Kind)
+	CostCenterKind             = "CostCenter"
+	CostCenterGroupKind        = schema.GroupKind{Group: CRDGroup, Kind: CostCenterKind}.String()
+	CostCenterKindAPIVersion   = CostCenterKind + "." + CRDGroupVersion.String()
+	CostCenterGroupVersionKind = CRDGroupVersion.WithKind(CostCenterKind)
 )
 
 func init() {
