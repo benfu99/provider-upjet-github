@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/pkg/errors"
@@ -44,16 +45,19 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 
 	cps := []managed.ConnectionPublisher{managed.NewAPISecretPublisher(mgr.GetClient(), mgr.GetScheme())}
 
+	recorder := event.NewAPIRecorder(mgr.GetEventRecorderFor(name))
+
 	r := managed.NewReconciler(mgr,
 		resource.ManagedKind(v1alpha1.CostCenterGroupVersionKind),
 		managed.WithExternalConnecter(&connector{
 			kube:         mgr.GetClient(),
 			usage:        resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1beta1.ProviderConfigUsage{}),
 			newServiceFn: newGitHubService,
+			recorder:     recorder,
 		}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
-		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
+		managed.WithRecorder(recorder),
 		managed.WithConnectionPublishers(cps...))
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -70,6 +74,7 @@ type connector struct {
 	kube         client.Client
 	usage        resource.Tracker
 	newServiceFn func(ctx context.Context, token string, baseURL string) GitHubService
+	recorder     event.Recorder
 }
 
 // Connect typically produces an ExternalClient by:
@@ -106,7 +111,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 
 	var creds githubCreds
 	if err := json.Unmarshal(data, &creds); err != nil {
-		return nil, errors.Wrap(err, errGetCreds)
+		return nil, errors.Wrap(err, "failed to parse GitHub credentials JSON")
 	}
 
 	token := ""
@@ -114,13 +119,17 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		token = *creds.Token
 	}
 
-	baseURL := ""
-	if creds.BaseURL != nil {
+	if token == "" {
+		return nil, errors.New("GitHub token is required but not provided in credentials")
+	}
+
+	baseURL := "https://api.github.com"
+	if creds.BaseURL != nil && *creds.BaseURL != "" {
 		baseURL = *creds.BaseURL
 	}
 
 	svc := c.newServiceFn(ctx, token, baseURL)
-	return &external{service: svc}, nil
+	return &external{service: svc, recorder: c.recorder}, nil
 }
 
 // CostCenter represents a GitHub cost center
@@ -168,7 +177,7 @@ func (s *gitHubService) makeRequest(ctx context.Context, method, path string, bo
 	if body != nil {
 		jsonBody, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to marshal request body: %w", err)
 		}
 		reqBody = bytes.NewBuffer(jsonBody)
 	} else {
@@ -176,9 +185,21 @@ func (s *gitHubService) makeRequest(ctx context.Context, method, path string, bo
 	}
 
 	url := fmt.Sprintf("%s/%s", s.baseURL, path)
+
+	// Add debug logging (you can see this in controller logs)
+	fmt.Printf("Making %s request to: %s\n", method, url)
+	if body != nil {
+		bodyJSON, err := json.Marshal(body)
+		if err != nil {
+			fmt.Printf("Request body: <failed to marshal: %v>\n", err)
+		} else {
+			fmt.Printf("Request body: %s\n", string(bodyJSON))
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+s.token)
@@ -189,7 +210,13 @@ func (s *gitHubService) makeRequest(ctx context.Context, method, path string, bo
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	return s.client.Do(req)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+
+	fmt.Printf("Response status: %d %s\n", resp.StatusCode, resp.Status)
+	return resp, nil
 }
 
 func (s *gitHubService) CreateCostCenter(ctx context.Context, enterprise, name string) (*CostCenter, error) {
@@ -199,19 +226,25 @@ func (s *gitHubService) CreateCostCenter(ctx context.Context, enterprise, name s
 
 	resp, err := s.makeRequest(ctx, "POST", path, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to make HTTP request: %w", err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API error: %d", resp.StatusCode)
+	// Read response body for error messages
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		bodyBytes = []byte("failed to read response body")
+	}
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API error: %d %s - Response: %s", resp.StatusCode, resp.Status, string(bodyBytes))
 	}
 
 	var costCenter CostCenter
-	if err := json.NewDecoder(resp.Body).Decode(&costCenter); err != nil {
-		return nil, err
+	if err := json.Unmarshal(bodyBytes, &costCenter); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w - Response: %s", err, string(bodyBytes))
 	}
 
 	return &costCenter, nil
@@ -222,24 +255,29 @@ func (s *gitHubService) GetCostCenter(ctx context.Context, enterprise, costCente
 
 	resp, err := s.makeRequest(ctx, "GET", path, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to make HTTP request: %w", err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, &NotFoundError{}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API error: %d", resp.StatusCode)
+		return nil, fmt.Errorf("GitHub API error: %d %s - Response: %s", resp.StatusCode, resp.Status, string(bodyBytes))
 	}
 
 	// The API returns an array with one element
 	var costCenters []CostCenter
-	if err := json.NewDecoder(resp.Body).Decode(&costCenters); err != nil {
-		return nil, err
+	if err := json.Unmarshal(bodyBytes, &costCenters); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w - Response: %s", err, string(bodyBytes))
 	}
 
 	if len(costCenters) == 0 {
@@ -315,7 +353,8 @@ func (e *NotFoundError) Error() string {
 // An ExternalClient observes, then either creates, updates, or deletes an
 // external resource to ensure it reflects the managed resource's desired state.
 type external struct {
-	service GitHubService
+	service  GitHubService
+	recorder event.Recorder
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
@@ -324,8 +363,13 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{}, errors.New(errNotCostCenter)
 	}
 
+	// Add debug logging
+	log := ctrl.LoggerFrom(ctx).WithValues("function", "Observe")
+	log.Info("Starting cost center observation", "name", cr.Name, "namespace", cr.Namespace)
+
 	// If we don't have an ID yet, the resource doesn't exist
 	if cr.Status.AtProvider.ID == nil {
+		log.Info("No ID found in status, resource doesn't exist yet")
 		return managed.ExternalObservation{
 			ResourceExists: false,
 		}, nil
@@ -333,19 +377,29 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	enterprise := cr.Spec.ForProvider.Enterprise
 	if enterprise == nil {
-		return managed.ExternalObservation{}, errors.New("enterprise must be specified")
+		err := errors.New("enterprise must be specified")
+		log.Error(err, "Missing enterprise specification")
+		return managed.ExternalObservation{}, err
 	}
+
+	log.Info("Getting cost center from GitHub API", "enterprise", *enterprise, "costCenterID", *cr.Status.AtProvider.ID)
 
 	costCenter, err := c.service.GetCostCenter(ctx, *enterprise, *cr.Status.AtProvider.ID)
 	if err != nil {
 		// If it's a 404, the resource doesn't exist
 		if IsNotFound(err) {
+			log.Info("Cost center not found in GitHub, marking as non-existent")
+			c.recorder.Event(cr, event.Normal("ResourceNotFound", "Cost center not found in GitHub"))
 			return managed.ExternalObservation{
 				ResourceExists: false,
 			}, nil
 		}
+		log.Error(err, "Failed to get cost center from GitHub API")
+		c.recorder.Event(cr, event.Warning("GetFailed", err))
 		return managed.ExternalObservation{}, errors.Wrap(err, errGetCostCenter)
 	}
+
+	log.Info("Successfully retrieved cost center", "id", costCenter.ID, "name", costCenter.Name, "state", costCenter.State)
 
 	// Update the status with the current state
 	cr.Status.AtProvider.ID = costCenter.ID
@@ -365,6 +419,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	// Check if the resource is up to date
 	upToDate := isUpToDate(costCenter, cr.Spec.ForProvider)
+	log.Info("Cost center observation complete", "upToDate", upToDate)
 
 	return managed.ExternalObservation{
 		ResourceExists:   true,
@@ -378,17 +433,29 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalCreation{}, errors.New(errNotCostCenter)
 	}
 
+	log := ctrl.LoggerFrom(ctx).WithValues("function", "Create")
+	log.Info("Starting cost center creation", "name", cr.Name, "namespace", cr.Namespace)
+
 	enterprise := cr.Spec.ForProvider.Enterprise
 	name := cr.Spec.ForProvider.Name
 
 	if enterprise == nil || name == nil {
-		return managed.ExternalCreation{}, errors.New("enterprise and name must be specified")
+		err := errors.New("enterprise and name must be specified")
+		log.Error(err, "Missing required parameters", "enterprise", enterprise, "name", name)
+		return managed.ExternalCreation{}, err
 	}
+
+	log.Info("Creating cost center in GitHub", "enterprise", *enterprise, "name", *name)
 
 	costCenter, err := c.service.CreateCostCenter(ctx, *enterprise, *name)
 	if err != nil {
+		log.Error(err, "Failed to create cost center in GitHub API")
+		c.recorder.Event(cr, event.Warning("CreateFailed", err))
 		return managed.ExternalCreation{}, errors.Wrap(err, errCreateCostCenter)
 	}
+
+	log.Info("Successfully created cost center", "id", costCenter.ID, "name", costCenter.Name, "state", costCenter.State)
+	c.recorder.Event(cr, event.Normal("Created", "Successfully created cost center in GitHub"))
 
 	// Update the status with the new ID
 	cr.Status.AtProvider.ID = costCenter.ID
