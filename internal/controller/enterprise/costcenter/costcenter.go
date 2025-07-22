@@ -443,6 +443,13 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		}, nil
 	}
 
+	// Debug: log the current status ID
+	var statusID string
+	if cr.Status.AtProvider.ID != nil {
+		statusID = *cr.Status.AtProvider.ID
+	}
+	fmt.Printf("Observe: Current status ID: %s\n", statusID)
+
 	enterprise := cr.Spec.ForProvider.Enterprise
 	if enterprise == nil {
 		err := errors.New("enterprise must be specified")
@@ -454,6 +461,9 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	costCenter, err := c.service.GetCostCenter(ctx, *enterprise, *cr.Status.AtProvider.ID)
 	if err != nil {
+		// Debug: log the specific error
+		fmt.Printf("Observe: GetCostCenter failed with error: %v\n", err)
+
 		// If it's a 404, the resource doesn't exist
 		if IsNotFound(err) {
 			log.Info("Cost center not found in GitHub, marking as non-existent")
@@ -466,6 +476,9 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		c.recorder.Event(cr, event.Warning("GetFailed", err))
 		return managed.ExternalObservation{}, errors.Wrap(err, errGetCostCenter)
 	}
+
+	// Debug: log successful retrieval
+	fmt.Printf("Observe: Successfully retrieved cost center from GitHub\n")
 
 	log.Info("Successfully retrieved cost center", "id", costCenter.ID, "name", costCenter.Name, "state", costCenter.State)
 
