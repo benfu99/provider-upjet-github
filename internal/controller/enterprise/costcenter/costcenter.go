@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/crossplane/crossplane-runtime/pkg/event"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
@@ -643,6 +644,11 @@ func (c *external) updateCostCenterStatus(cr *v1alpha1.CostCenter, costCenter *C
 	cr.Status.AtProvider.Name = costCenter.Name
 	cr.Status.AtProvider.State = costCenter.State
 
+	// Set the external name to the actual cost center name returned from GitHub API
+	if costCenter.Name != nil {
+		meta.SetExternalName(cr, *costCenter.Name)
+	}
+
 	// Convert resources
 	if costCenter.Resources != nil {
 		cr.Status.AtProvider.Resources = make([]v1alpha1.CostCenterResource, len(costCenter.Resources))
@@ -718,6 +724,11 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	cr.Status.AtProvider.ID = costCenter.ID
 	cr.Status.AtProvider.Name = costCenter.Name
 	cr.Status.AtProvider.State = costCenter.State
+
+	// Set the external name to the actual cost center name returned from GitHub API
+	if costCenter.Name != nil {
+		meta.SetExternalName(cr, *costCenter.Name)
+	}
 
 	// Log the ID was set
 	log.V(1).Info("Set cost center ID in status", "statusID", getValue(cr.Status.AtProvider.ID))
