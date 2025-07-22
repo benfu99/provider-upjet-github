@@ -153,6 +153,7 @@ type Resource struct {
 type GitHubService interface {
 	CreateCostCenter(ctx context.Context, enterprise, name string) (*CostCenter, error)
 	GetCostCenter(ctx context.Context, enterprise, costCenterID string) (*CostCenter, error)
+	ListCostCenters(ctx context.Context, enterprise string) ([]CostCenter, error)
 	UpdateCostCenter(ctx context.Context, enterprise, costCenterID, name string) (*CostCenter, error)
 	DeleteCostCenter(ctx context.Context, enterprise, costCenterID string) error
 }
@@ -245,10 +246,16 @@ func (s *gitHubService) CreateCostCenter(ctx context.Context, enterprise, name s
 		return nil, fmt.Errorf("GitHub API error: %d %s - Response: %s", resp.StatusCode, resp.Status, string(bodyBytes))
 	}
 
+	// Debug: log the response for troubleshooting
+	fmt.Printf("CreateCostCenter response body: %s\n", string(bodyBytes))
+
 	var costCenter CostCenter
 	if err := json.Unmarshal(bodyBytes, &costCenter); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w - Response: %s", err, string(bodyBytes))
 	}
+
+	// Debug: log the parsed cost center
+	fmt.Printf("Parsed cost center - ID: %v, Name: %v, State: %v\n", costCenter.ID, costCenter.Name, costCenter.State)
 
 	return &costCenter, nil
 }
@@ -288,6 +295,34 @@ func (s *gitHubService) GetCostCenter(ctx context.Context, enterprise, costCente
 	}
 
 	return &costCenters[0], nil
+}
+
+func (s *gitHubService) ListCostCenters(ctx context.Context, enterprise string) ([]CostCenter, error) {
+	path := fmt.Sprintf("enterprises/%s/settings/billing/cost-centers", enterprise)
+
+	resp, err := s.makeRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make HTTP request: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API error: %d %s - Response: %s", resp.StatusCode, resp.Status, string(bodyBytes))
+	}
+
+	var costCenters []CostCenter
+	if err := json.Unmarshal(bodyBytes, &costCenters); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w - Response: %s", err, string(bodyBytes))
+	}
+
+	return costCenters, nil
 }
 
 func (s *gitHubService) UpdateCostCenter(ctx context.Context, enterprise, costCenterID, name string) (*CostCenter, error) {
@@ -452,8 +487,43 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	costCenter, err := c.service.CreateCostCenter(ctx, *enterprise, *name)
 	if err != nil {
-		log.Error(err, "Failed to create cost center in GitHub API")
-		c.recorder.Event(cr, event.Warning("CreateFailed", err))
+		// Check if it's a 409 conflict (cost center already exists)
+		if strings.Contains(err.Error(), "409") && strings.Contains(err.Error(), "already exists") {
+			log.Info("Cost center already exists, attempting to find it", "enterprise", *enterprise, "name", *name)
+
+			// List all cost centers and find the one with matching name
+			costCenters, listErr := c.service.ListCostCenters(ctx, *enterprise)
+			if listErr != nil {
+				log.Error(listErr, "Failed to list cost centers")
+				c.recorder.Event(cr, event.Warning("CreateFailed", fmt.Errorf("cost center exists but failed to find it: %w", listErr)))
+				return managed.ExternalCreation{}, errors.Wrap(listErr, errCreateCostCenter)
+			}
+
+			// Find the cost center with matching name
+			for _, cc := range costCenters {
+				if cc.Name != nil && *cc.Name == *name {
+					log.Info("Found existing cost center", "id", cc.ID, "name", cc.Name, "state", cc.State)
+					c.recorder.Event(cr, event.Normal("Found", "Found existing cost center in GitHub"))
+
+					// Update the status with the existing cost center's ID
+					cr.Status.AtProvider.ID = cc.ID
+					cr.Status.AtProvider.Name = cc.Name
+					cr.Status.AtProvider.State = cc.State
+
+					// Debug: verify the ID was set
+					fmt.Printf("Set existing cost center ID in status: %v\n", cr.Status.AtProvider.ID)
+
+					return managed.ExternalCreation{}, nil
+				}
+			}
+
+			// If we get here, we couldn't find the cost center despite the 409 error
+			log.Error(err, "Cost center exists but could not find it in list")
+			c.recorder.Event(cr, event.Warning("CreateFailed", fmt.Errorf("cost center exists but not found in list: %w", err)))
+		} else {
+			log.Error(err, "Failed to create cost center in GitHub API")
+			c.recorder.Event(cr, event.Warning("CreateFailed", err))
+		}
 		return managed.ExternalCreation{}, errors.Wrap(err, errCreateCostCenter)
 	}
 
@@ -464,6 +534,9 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	cr.Status.AtProvider.ID = costCenter.ID
 	cr.Status.AtProvider.Name = costCenter.Name
 	cr.Status.AtProvider.State = costCenter.State
+
+	// Debug: verify the ID was set
+	fmt.Printf("Set cost center ID in status: %v\n", cr.Status.AtProvider.ID)
 
 	return managed.ExternalCreation{}, nil
 }
