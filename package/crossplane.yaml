@@ -3,8 +3,8 @@ kind: Provider
 metadata:
   name: provider-upjet-github
   annotations:
-    meta.crossplane.io/maintainer: benfu99
-    meta.crossplane.io/source: github.com/benfu99/provider-upjet-github
+    meta.crossplane.io/maintainer: Coop Norge SA
+    meta.crossplane.io/source: github.com/crossplane-contrib/provider-upjet-github
     meta.crossplane.io/license: Apache-2.0
     meta.crossplane.io/description: |
       The Github Crossplane provider adds support for 
@@ -15,6 +15,6 @@ metadata:
       [Github](https://github.com). 
 
       It is based on the Terraform Github provider. Read the 
-      [readme](https://github.com/benfu99/provider-upjet-github/blob/main/README.md)
+      [readme](https://github.com/crossplane-contrib/provider-upjet-github/blob/main/README.md)
       for instructions.
 

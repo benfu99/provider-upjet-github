@@ -3,7 +3,7 @@
 
 PROVIDER_NAME := upjet-github
 PROJECT_NAME := provider-$(PROVIDER_NAME)
-PROJECT_REPO := $(shell git remote get-url origin | sed 's/.*github\.com[:/]\([^/]*\/[^/]*\)\.git/github.com\/\1/' | sed 's/\.git$$//')
+PROJECT_REPO := github.com/crossplane-contrib/$(PROJECT_NAME)
 
 
 export TERRAFORM_VERSION := 1.5.5
@@ -61,15 +61,17 @@ UPTEST_VERSION = v0.11.1
 # ====================================================================================
 # Setup Images
 
-REGISTRY_ORGS ?= ghcr.io/$(shell echo $(PROJECT_REPO) | cut -d'/' -f2)
+REGISTRY_ORGS ?= xpkg.upbound.io/crossplane-contrib
 IMAGES = $(PROJECT_NAME)
 -include build/makelib/imagelight.mk
 
 # ====================================================================================
 # Setup XPKG
 
-XPKG_REG_ORGS ?= ghcr.io/$(shell echo $(PROJECT_REPO) | cut -d'/' -f2)
-XPKG_REG_ORGS_NO_PROMOTE ?= ghcr.io/$(shell echo $(PROJECT_REPO) | cut -d'/' -f2)
+XPKG_REG_ORGS ?= xpkg.upbound.io/crossplane-contrib
+# NOTE(hasheddan): skip promoting on xpkg.upbound.io as channel tags are
+# inferred.
+XPKG_REG_ORGS_NO_PROMOTE ?= xpkg.upbound.io/crossplane-contrib
 XPKGS = $(PROJECT_NAME)
 -include build/makelib/xpkg.mk
 

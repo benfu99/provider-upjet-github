@@ -11,6 +11,10 @@ env:
   GO_VERSION: '1.22'
   GOLANGCI_VERSION: 'v1.55.2'
   DOCKER_BUILDX_VERSION: 'v0.25.0'
+  # Common users. We can't run a step 'if secrets.XXX != ""' but we can run a
+  # step 'if env.XXX != ""', so we copy these to succinctly test whether
+  # credentials have been provided before trying to run steps that need them.
+  UPBOUND_MARKETPLACE_PUSH_ROBOT_USR: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR }}
 jobs:
   detect-noop:
     runs-on: ubuntu-22.04
@@ -171,9 +175,6 @@ jobs:
     runs-on: ubuntu-22.04
     needs: detect-noop
     if: needs.detect-noop.outputs.noop != 'true'
-    permissions:
-      contents: read
-      packages: write
     steps:
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v3
@@ -184,12 +185,13 @@ jobs:
         with:
           version: ${{ env.DOCKER_BUILDX_VERSION }}
           install: true
-      - name: Login to GitHub Container Registry
+      - name: Login to Upbound
         uses: docker/login-action@v3
+        if: env.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR != ''
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: xpkg.upbound.io
+          username: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR }}
+          password: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_PSW }}
       - name: Checkout
         uses: actions/checkout@v4
         with:
