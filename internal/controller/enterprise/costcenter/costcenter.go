@@ -434,12 +434,95 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	// Add debug logging
 	log := ctrl.LoggerFrom(ctx).WithValues("function", "Observe")
 	log.Info("Starting cost center observation", "name", cr.Name, "namespace", cr.Namespace)
+	fmt.Printf("Observe: Function called for cost center %s\n", cr.Name)
 
-	// If we don't have an ID yet, the resource doesn't exist
+	// Helper function to safely get string value from pointer
+	getValue := func(ptr *string) string {
+		if ptr != nil {
+			return *ptr
+		}
+		return ""
+	}
+
+	// If we don't have an ID yet, the resource doesn't exist locally
+	// But it might exist in GitHub, so we need to check
 	if cr.Status.AtProvider.ID == nil {
-		log.Info("No ID found in status, resource doesn't exist yet")
+		log.Info("No ID found in status, checking if resource exists in GitHub")
+		fmt.Printf("Observe: No ID in status, checking for existing resource by name\n")
+		
+		enterprise := cr.Spec.ForProvider.Enterprise
+		name := cr.Spec.ForProvider.Name
+		
+		if enterprise == nil || name == nil {
+			err := errors.New("enterprise and name must be specified")
+			log.Error(err, "Missing required parameters for existence check")
+			return managed.ExternalObservation{}, err
+		}
+		
+		// List all cost centers and check if one with our name exists
+		log.Info("Listing cost centers to check for existing resource", "enterprise", *enterprise, "name", *name)
+		costCenters, err := c.service.ListCostCenters(ctx, *enterprise)
+		if err != nil {
+			log.Error(err, "Failed to list cost centers during existence check")
+			c.recorder.Event(cr, event.Warning("ListFailed", err))
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to check for existing cost center")
+		}
+		
+		// Look for a cost center with matching name (prefer active ones)
+		var matchingCostCenter *CostCenter
+		for _, cc := range costCenters {
+			if cc.Name != nil && *cc.Name == *name {
+				// If we haven't found one yet, or if this one is active and our current match isn't
+				if matchingCostCenter == nil ||
+					(cc.State != nil && *cc.State == "active" &&
+						(matchingCostCenter.State == nil || *matchingCostCenter.State != "active")) {
+					ccCopy := cc // Make a copy to avoid pointer issues
+					matchingCostCenter = &ccCopy
+				}
+			}
+		}
+		
+		if matchingCostCenter == nil {
+			// No existing resource found
+			log.Info("No existing cost center found in GitHub")
+			fmt.Printf("Observe: No existing resource found, returning ResourceExists=false\n")
+			return managed.ExternalObservation{
+				ResourceExists: false,
+			}, nil
+		}
+		
+		// Found an existing resource - adopt it
+		log.Info("Found existing cost center in GitHub, adopting it",
+			"id", getValue(matchingCostCenter.ID),
+			"name", getValue(matchingCostCenter.Name),
+			"state", getValue(matchingCostCenter.State))
+		c.recorder.Event(cr, event.Normal("AdoptedExistingResource", "Found and adopted existing cost center in GitHub"))
+		fmt.Printf("Observe: Found existing resource, adopting it with ID: %s\n", getValue(matchingCostCenter.ID))
+		
+		// Update the status with the existing cost center's details
+		// This is the proper place to update status - in Observe after finding the external resource
+		cr.Status.AtProvider.ID = matchingCostCenter.ID
+		cr.Status.AtProvider.Name = matchingCostCenter.Name
+		cr.Status.AtProvider.State = matchingCostCenter.State
+		
+		// Convert resources
+		if matchingCostCenter.Resources != nil {
+			cr.Status.AtProvider.Resources = make([]v1alpha1.CostCenterResource, len(matchingCostCenter.Resources))
+			for i, res := range matchingCostCenter.Resources {
+				cr.Status.AtProvider.Resources[i] = v1alpha1.CostCenterResource{
+					Type: res.Type,
+					Name: res.Name,
+				}
+			}
+		}
+		
+		// Check if the resource is up to date
+		upToDate := isUpToDate(matchingCostCenter, cr.Spec.ForProvider)
+		log.Info("Adopted existing cost center", "upToDate", upToDate)
+		
 		return managed.ExternalObservation{
-			ResourceExists: false,
+			ResourceExists:   true,
+			ResourceUpToDate: upToDate,
 		}, nil
 	}
 
@@ -472,13 +555,45 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				ResourceExists: false,
 			}, nil
 		}
-		log.Error(err, "Failed to get cost center from GitHub API")
-		c.recorder.Event(cr, event.Warning("GetFailed", err))
-		return managed.ExternalObservation{}, errors.Wrap(err, errGetCostCenter)
-	}
 
-	// Debug: log successful retrieval
-	fmt.Printf("Observe: Successfully retrieved cost center from GitHub\n")
+		// If GetCostCenter fails but we have an ID, try to verify via ListCostCenters
+		// This handles cases where the GetCostCenter endpoint might not work properly
+		log.Info("GetCostCenter failed, attempting to verify via ListCostCenters", "error", err.Error())
+		fmt.Printf("Observe: Falling back to ListCostCenters to verify existence\n")
+		
+		costCenters, listErr := c.service.ListCostCenters(ctx, *enterprise)
+		if listErr != nil {
+			log.Error(listErr, "Failed to list cost centers during fallback verification")
+			c.recorder.Event(cr, event.Warning("GetFailed", fmt.Errorf("both GetCostCenter and ListCostCenters failed: %w", listErr)))
+			return managed.ExternalObservation{}, errors.Wrap(listErr, errGetCostCenter)
+		}
+
+		// Look for the cost center by ID in the list
+		var foundCostCenter *CostCenter
+		for _, cc := range costCenters {
+			if cc.ID != nil && *cc.ID == *cr.Status.AtProvider.ID {
+				ccCopy := cc // Make a copy to avoid pointer issues
+				foundCostCenter = &ccCopy
+				break
+			}
+		}
+
+		if foundCostCenter == nil {
+			log.Info("Cost center not found in list, marking as non-existent")
+			c.recorder.Event(cr, event.Normal("ResourceNotFound", "Cost center not found in GitHub via list verification"))
+			return managed.ExternalObservation{
+				ResourceExists: false,
+			}, nil
+		}
+
+		// Use the found cost center
+		costCenter = foundCostCenter
+		log.Info("Successfully verified cost center via ListCostCenters fallback")
+		fmt.Printf("Observe: Found cost center via ListCostCenters fallback\n")
+	} else {
+		// Debug: log successful retrieval
+		fmt.Printf("Observe: Successfully retrieved cost center from GitHub via GetCostCenter\n")
+	}
 
 	log.Info("Successfully retrieved cost center", "id", costCenter.ID, "name", costCenter.Name, "state", costCenter.State)
 
@@ -508,78 +623,17 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}, nil
 }
 
-// findBestMatchingCostCenter finds the best matching cost center by name, preferring active ones
-func findBestMatchingCostCenter(costCenters []CostCenter, name string) *CostCenter {
-	var matchingCostCenter *CostCenter
-	for _, cc := range costCenters {
-		if cc.Name != nil && *cc.Name == name {
-			// If we haven't found one yet, or if this one is active and our current match isn't
-			if matchingCostCenter == nil ||
-				(cc.State != nil && *cc.State == "active" &&
-					(matchingCostCenter.State == nil || *matchingCostCenter.State != "active")) {
-				ccCopy := cc // Make a copy to avoid pointer issues
-				matchingCostCenter = &ccCopy
-			}
-		}
-	}
-	return matchingCostCenter
-}
-
-// updateStatusWithCostCenter updates the CostCenter status with the provided cost center data
-func (c *external) updateStatusWithCostCenter(ctx context.Context, cr *v1alpha1.CostCenter, costCenter *CostCenter) {
-	log := ctrl.LoggerFrom(ctx)
-
-	// Helper function to safely get string value from pointer
-	getValue := func(ptr *string) string {
-		if ptr != nil {
-			return *ptr
-		}
-		return ""
-	}
-
-	log.Info("Found existing cost center",
-		"id", getValue(costCenter.ID),
-		"name", getValue(costCenter.Name),
-		"state", getValue(costCenter.State))
-	c.recorder.Event(cr, event.Normal("Found", "Found existing cost center in GitHub"))
-
-	// Update the status with the existing cost center's ID
-	cr.Status.AtProvider.ID = costCenter.ID
-	cr.Status.AtProvider.Name = costCenter.Name
-	cr.Status.AtProvider.State = costCenter.State
-
-	// Debug: verify the ID was set (dereference pointer to show actual value)
-	var statusID string
-	if cr.Status.AtProvider.ID != nil {
-		statusID = *cr.Status.AtProvider.ID
-	}
-	fmt.Printf("Set existing cost center ID in status: %s\n", statusID)
-}
-
 // handleExistingCostCenter handles the case where a cost center already exists (409 conflict)
 func (c *external) handleExistingCostCenter(ctx context.Context, cr *v1alpha1.CostCenter, enterprise, name string, originalErr error) (managed.ExternalCreation, error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("function", "handleExistingCostCenter")
-	log.Info("Cost center already exists, attempting to find it", "enterprise", enterprise, "name", name)
+	log.Info("Cost center already exists, will be adopted on next observation", "enterprise", enterprise, "name", name)
 
-	// List all cost centers and find the one with matching name
-	costCenters, listErr := c.service.ListCostCenters(ctx, enterprise)
-	if listErr != nil {
-		log.Error(listErr, "Failed to list cost centers")
-		c.recorder.Event(cr, event.Warning("CreateFailed", fmt.Errorf("cost center exists but failed to find it: %w", listErr)))
-		return managed.ExternalCreation{}, errors.Wrap(listErr, errCreateCostCenter)
-	}
-
-	// Find the best matching cost center (preferring active ones)
-	matchingCostCenter := findBestMatchingCostCenter(costCenters, name)
-	if matchingCostCenter != nil {
-		c.updateStatusWithCostCenter(ctx, cr, matchingCostCenter)
-		return managed.ExternalCreation{}, nil
-	}
-
-	// If we get here, we couldn't find the cost center despite the 409 error
-	log.Error(originalErr, "Cost center exists but could not find it in list")
-	c.recorder.Event(cr, event.Warning("CreateFailed", fmt.Errorf("cost center exists but not found in list: %w", originalErr)))
-	return managed.ExternalCreation{}, errors.Wrap(originalErr, errCreateCostCenter)
+	// Don't try to find and adopt the resource here - let the next Observe call handle it
+	// The key insight is that we should return success from Create and let Observe discover the resource
+	c.recorder.Event(cr, event.Normal("ExistingResourceDetected", "Cost center already exists and will be adopted"))
+	
+	// Return success - the next Observe call will find and adopt the existing resource
+	return managed.ExternalCreation{}, nil
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
