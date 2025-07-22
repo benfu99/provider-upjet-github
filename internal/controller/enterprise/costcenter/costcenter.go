@@ -125,14 +125,14 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 
 // CostCenter represents a GitHub cost center
 type CostCenter struct {
-	ID        *string              `json:"id,omitempty"`
-	Name      *string              `json:"name,omitempty"`
-	State     *string              `json:"state,omitempty"`
-	Resources []CostCenterResource `json:"resources,omitempty"`
+	ID        *string    `json:"id,omitempty"`
+	Name      *string    `json:"name,omitempty"`
+	State     *string    `json:"state,omitempty"`
+	Resources []Resource `json:"resources,omitempty"`
 }
 
-// CostCenterResource represents a resource associated with a cost center
-type CostCenterResource struct {
+// Resource represents a resource associated with a cost center
+type Resource struct {
 	Type *string `json:"type,omitempty"`
 	Name *string `json:"name,omitempty"`
 }
@@ -202,9 +202,7 @@ func (s *gitHubService) CreateCostCenter(ctx context.Context, enterprise, name s
 		return nil, err
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			// Log the error but don't override the main return value
-		}
+		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode != http.StatusOK {
@@ -227,9 +225,7 @@ func (s *gitHubService) GetCostCenter(ctx context.Context, enterprise, costCente
 		return nil, err
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			// Log the error but don't override the main return value
-		}
+		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode == http.StatusNotFound {
@@ -263,9 +259,7 @@ func (s *gitHubService) UpdateCostCenter(ctx context.Context, enterprise, costCe
 		return nil, err
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			// Log the error but don't override the main return value
-		}
+		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode == http.StatusNotFound {
@@ -297,9 +291,7 @@ func (s *gitHubService) DeleteCostCenter(ctx context.Context, enterprise, costCe
 		return err
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			// Log the error but don't override the main return value
-		}
+		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode == http.StatusNotFound {
