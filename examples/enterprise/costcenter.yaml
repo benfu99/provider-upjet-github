@@ -1,0 +1,10 @@
+apiVersion: enterprise.github.upbound.io/v1alpha1
+kind: CostCenter
+metadata:
+  name: example-cost-center
+spec:
+  forProvider:
+    enterprise: "my-enterprise"
+    name: "Development Cost Center"
+  providerConfigRef:
+    name: default

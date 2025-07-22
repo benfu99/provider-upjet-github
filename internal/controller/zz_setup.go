@@ -19,6 +19,7 @@ import (
 	repositoryaccesslevel "github.com/crossplane-contrib/provider-upjet-github/internal/controller/actions/repositoryaccesslevel"
 	repositorypermissions "github.com/crossplane-contrib/provider-upjet-github/internal/controller/actions/repositorypermissions"
 	runnergroup "github.com/crossplane-contrib/provider-upjet-github/internal/controller/actions/runnergroup"
+	costcenter "github.com/crossplane-contrib/provider-upjet-github/internal/controller/enterprise/costcenter"
 	organization "github.com/crossplane-contrib/provider-upjet-github/internal/controller/enterprise/organization"
 	organizationruleset "github.com/crossplane-contrib/provider-upjet-github/internal/controller/enterprise/organizationruleset"
 	providerconfig "github.com/crossplane-contrib/provider-upjet-github/internal/controller/providerconfig"
@@ -62,6 +63,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		repositoryaccesslevel.Setup,
 		repositorypermissions.Setup,
 		runnergroup.Setup,
+		costcenter.Setup,
 		organization.Setup,
 		organizationruleset.Setup,
 		providerconfig.Setup,
