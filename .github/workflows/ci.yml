@@ -14,7 +14,7 @@ env:
   # Common users. We can't run a step 'if secrets.XXX != ""' but we can run a
   # step 'if env.XXX != ""', so we copy these to succinctly test whether
   # credentials have been provided before trying to run steps that need them.
-  UPBOUND_MARKETPLACE_PUSH_ROBOT_USR: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR }}
+  GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 jobs:
   detect-noop:
     runs-on: ubuntu-22.04
@@ -185,13 +185,13 @@ jobs:
         with:
           version: ${{ env.DOCKER_BUILDX_VERSION }}
           install: true
-      - name: Login to Upbound
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
-        if: env.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR != ''
+        if: env.GHCR_TOKEN != ''
         with:
-          registry: xpkg.upbound.io
-          username: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR }}
-          password: ${{ secrets.UPBOUND_MARKETPLACE_PUSH_ROBOT_PSW }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -232,3 +232,5 @@ jobs:
           path: _output/**
       - name: Publish Artifacts
         run: make publish BRANCH_NAME=${GITHUB_REF##*/}
+        env:
+          REGISTRY_ORG: ${{ github.repository_owner }}
