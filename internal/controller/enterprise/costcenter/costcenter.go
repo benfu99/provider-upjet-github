@@ -12,15 +12,18 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
+	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
-	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/crossplane/upjet/pkg/controller"
@@ -47,93 +50,29 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 
 	o.Logger.Info("Setting up CostCenter controller", "name", name)
 
-	cps := []managed.ConnectionPublisher{managed.NewAPISecretPublisher(mgr.GetClient(), mgr.GetScheme())}
+	// IMPORTANT: Try bypassing the managed reconciler pattern that might be interfering with upjet
+	// Instead use a direct controller-runtime approach
+	reconciler := &DirectCostCenterReconciler{
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Logger:       o.Logger.WithValues("controller", name),
+		newServiceFn: newGitHubService,
+		recorder:     event.NewAPIRecorder(mgr.GetEventRecorderFor(name)),
+	}
 
-	recorder := event.NewAPIRecorder(mgr.GetEventRecorderFor(name))
-
-	r := managed.NewReconciler(mgr,
-		resource.ManagedKind(v1alpha1.CostCenterGroupVersionKind),
-		managed.WithExternalConnecter(&connector{
-			kube:         mgr.GetClient(),
-			usage:        resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1beta1.ProviderConfigUsage{}),
-			newServiceFn: newGitHubService,
-			recorder:     recorder,
-		}),
-		managed.WithLogger(o.Logger.WithValues("controller", name)),
-		managed.WithPollInterval(o.PollInterval),
-		managed.WithRecorder(recorder),
-		managed.WithConnectionPublishers(cps...))
-
-	return ctrl.NewControllerManagedBy(mgr).
-		Named(name).
+	err := ctrl.NewControllerManagedBy(mgr).
+		Named(name + "-direct").
 		WithOptions(o.ForControllerRuntime()).
-		WithEventFilter(resource.DesiredStateChanged()).
 		For(&v1alpha1.CostCenter{}).
-		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
-}
+		Complete(reconciler)
 
-// A connector is expected to produce an ExternalClient when its Connect method
-// is called.
-type connector struct {
-	kube         client.Client
-	usage        resource.Tracker
-	newServiceFn func(ctx context.Context, token string, baseURL string) GitHubService
-	recorder     event.Recorder
-}
-
-// Connect typically produces an ExternalClient by:
-// 1. Tracking that the managed resource is using a ProviderConfig.
-// 2. Getting the managed resource's ProviderConfig.
-// 3. Getting the credentials specified by the ProviderConfig.
-// 4. Using the credentials to form a client.
-func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) {
-	cr, ok := mg.(*v1alpha1.CostCenter)
-	if !ok {
-		return nil, errors.New(errNotCostCenter)
-	}
-
-	if err := c.usage.Track(ctx, mg); err != nil {
-		return nil, errors.Wrap(err, errTrackPCUsage)
-	}
-
-	pc := &apisv1beta1.ProviderConfig{}
-	if err := c.kube.Get(ctx, types.NamespacedName{Name: cr.GetProviderConfigReference().Name}, pc); err != nil {
-		return nil, errors.Wrap(err, errGetPC)
-	}
-
-	cd := pc.Spec.Credentials
-	data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
 	if err != nil {
-		return nil, errors.Wrap(err, errGetCreds)
+		o.Logger.Info("Failed to setup CostCenter controller", "error", err)
+		return err
 	}
 
-	// Parse credentials as JSON
-	type githubCreds struct {
-		Token   *string `json:"token,omitempty"`
-		BaseURL *string `json:"base_url,omitempty"`
-	}
-
-	var creds githubCreds
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return nil, errors.Wrap(err, "failed to parse GitHub credentials JSON")
-	}
-
-	token := ""
-	if creds.Token != nil {
-		token = *creds.Token
-	}
-
-	if token == "" {
-		return nil, errors.New("GitHub token is required but not provided in credentials")
-	}
-
-	baseURL := "https://api.github.com"
-	if creds.BaseURL != nil && *creds.BaseURL != "" {
-		baseURL = *creds.BaseURL
-	}
-
-	svc := c.newServiceFn(ctx, token, baseURL)
-	return &external{service: svc, recorder: c.recorder}, nil
+	o.Logger.Info("Successfully completed CostCenter controller setup", "name", name)
+	return nil
 }
 
 // CostCenter represents a GitHub cost center
@@ -399,22 +338,38 @@ func (s *gitHubService) UpdateCostCenter(ctx context.Context, enterprise, costCe
 func (s *gitHubService) DeleteCostCenter(ctx context.Context, enterprise, costCenterID string) error {
 	path := fmt.Sprintf("enterprises/%s/settings/billing/cost-centers/%s", enterprise, costCenterID)
 
+	log := ctrl.LoggerFrom(ctx)
+	log.Info("Making DELETE request to GitHub API", "enterprise", enterprise, "costCenterID", costCenterID, "path", path)
+
 	resp, err := s.makeRequest(ctx, "DELETE", path, nil)
 	if err != nil {
+		log.Error(err, "Failed to make DELETE request to GitHub API")
 		return err
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
 
+	log.Info("DELETE request completed", "statusCode", resp.StatusCode)
+
+	// Read response body for debugging
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		bodyBytes = []byte("failed to read response body")
+	}
+	log.V(1).Info("DELETE response body", "responseBody", string(bodyBytes))
+
 	if resp.StatusCode == http.StatusNotFound {
+		log.Info("Cost center not found (404), treating as successfully deleted")
 		return &NotFoundError{}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GitHub API error: %d", resp.StatusCode)
+		log.Error(nil, "GitHub API returned error status", "statusCode", resp.StatusCode, "responseBody", string(bodyBytes))
+		return fmt.Errorf("GitHub API error: %d - Response: %s", resp.StatusCode, string(bodyBytes))
 	}
 
+	log.Info("Successfully deleted cost center from GitHub")
 	return nil
 }
 
@@ -522,12 +477,36 @@ func (c *external) observeWithID(ctx context.Context, cr *v1alpha1.CostCenter) (
 	// Update status and return observation
 	c.updateCostCenterStatus(cr, costCenter)
 	upToDate := isUpToDate(costCenter, cr.Spec.ForProvider)
-	log.Info("Cost center observation complete", "upToDate", upToDate)
 
-	return managed.ExternalObservation{
-		ResourceExists:   true,
-		ResourceUpToDate: upToDate,
-	}, nil
+	// Enhanced debugging for the Ready condition issue
+	log.Info("Cost center observation complete",
+		"upToDate", upToDate,
+		"githubName", getValue(costCenter.Name),
+		"specName", getValue(cr.Spec.ForProvider.Name),
+		"githubState", getValue(costCenter.State),
+		"statusID", getValue(cr.Status.AtProvider.ID))
+
+	observation := managed.ExternalObservation{
+		ResourceExists:          true,
+		ResourceUpToDate:        upToDate,
+		ResourceLateInitialized: false, // We don't late-initialize any fields
+	}
+
+	// Set connection details if needed (for Ready condition)
+	if costCenter.ID != nil && costCenter.Name != nil {
+		observation.ConnectionDetails = managed.ConnectionDetails{
+			"id":   []byte(*costCenter.ID),
+			"name": []byte(*costCenter.Name),
+		}
+	}
+
+	log.Info("Returning observation",
+		"resourceExists", observation.ResourceExists,
+		"resourceUpToDate", observation.ResourceUpToDate,
+		"resourceLateInitialized", observation.ResourceLateInitialized,
+		"hasConnectionDetails", len(observation.ConnectionDetails) > 0)
+
+	return observation, nil
 }
 
 // findCostCenterByName finds a cost center by name in the enterprise
@@ -541,10 +520,15 @@ func (c *external) findCostCenterByName(ctx context.Context, enterprise, name st
 		return nil, errors.Wrap(err, "failed to check for existing cost center")
 	}
 
-	// Look for a cost center with matching name (prefer active ones)
+	// Look for a cost center with matching name (prefer active ones, exclude deleted ones)
 	var matchingCostCenter *CostCenter
 	for _, cc := range costCenters {
 		if cc.Name != nil && *cc.Name == name {
+			// Skip deleted cost centers - they should not be considered as existing
+			if cc.State != nil && *cc.State == "deleted" {
+				continue
+			}
+
 			// If we haven't found one yet, or if this one is active and our current match isn't
 			if matchingCostCenter == nil ||
 				(cc.State != nil && *cc.State == "active" &&
@@ -585,10 +569,27 @@ func (c *external) adoptExistingCostCenter(ctx context.Context, cr *v1alpha1.Cos
 		"githubName", getValue(costCenter.Name),
 		"specName", getValue(cr.Spec.ForProvider.Name))
 
-	return managed.ExternalObservation{
-		ResourceExists:   true,
-		ResourceUpToDate: upToDate,
-	}, nil
+	observation := managed.ExternalObservation{
+		ResourceExists:          true,
+		ResourceUpToDate:        upToDate,
+		ResourceLateInitialized: false, // We don't late-initialize any fields
+	}
+
+	// Set connection details if needed (for Ready condition)
+	if costCenter.ID != nil && costCenter.Name != nil {
+		observation.ConnectionDetails = managed.ConnectionDetails{
+			"id":   []byte(*costCenter.ID),
+			"name": []byte(*costCenter.Name),
+		}
+	}
+
+	log.Info("Returning adoption observation",
+		"resourceExists", observation.ResourceExists,
+		"resourceUpToDate", observation.ResourceUpToDate,
+		"resourceLateInitialized", observation.ResourceLateInitialized,
+		"hasConnectionDetails", len(observation.ConnectionDetails) > 0)
+
+	return observation, nil
 }
 
 // getCostCenterWithFallback tries to get a cost center by ID with fallback to list search
@@ -625,9 +626,15 @@ func (c *external) getCostCenterFromList(ctx context.Context, enterprise, id str
 		return nil, errors.Wrap(listErr, errGetCostCenter)
 	}
 
-	// Look for the cost center by ID in the list
+	// Look for the cost center by ID in the list (exclude deleted ones)
 	for _, cc := range costCenters {
 		if cc.ID != nil && *cc.ID == id {
+			// If we find the cost center but it's deleted, treat it as non-existent
+			if cc.State != nil && *cc.State == "deleted" {
+				log.Info("Cost center found but marked as deleted, treating as non-existent", "id", id, "state", *cc.State)
+				return nil, nil
+			}
+
 			ccCopy := cc // Make a copy to avoid pointer issues
 			log.Info("Successfully verified cost center via ListCostCenters fallback")
 			return &ccCopy, nil
@@ -731,9 +738,19 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	}
 
 	// Log the ID was set
-	log.V(1).Info("Set cost center ID in status", "statusID", getValue(cr.Status.AtProvider.ID))
+	log.Info("Set cost center ID in status", "statusID", getValue(cr.Status.AtProvider.ID))
 
-	return managed.ExternalCreation{}, nil
+	// Return creation result with connection details
+	creation := managed.ExternalCreation{}
+	if costCenter.ID != nil && costCenter.Name != nil {
+		creation.ConnectionDetails = managed.ConnectionDetails{
+			"id":   []byte(*costCenter.ID),
+			"name": []byte(*costCenter.Name),
+		}
+		log.Info("Returning creation with connection details", "hasConnectionDetails", true)
+	}
+
+	return creation, nil
 }
 
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
@@ -759,6 +776,11 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	cr.Status.AtProvider.Name = costCenter.Name
 	cr.Status.AtProvider.State = costCenter.State
 
+	// Set the external name to the actual cost center name returned from GitHub API
+	if costCenter.Name != nil {
+		meta.SetExternalName(cr, *costCenter.Name)
+	}
+
 	return managed.ExternalUpdate{}, nil
 }
 
@@ -768,16 +790,32 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return errors.New(errNotCostCenter)
 	}
 
+	log := ctrl.LoggerFrom(ctx).WithValues("function", "Delete")
+	log.Info("Starting cost center deletion", "name", cr.Name, "namespace", cr.Namespace)
+
 	enterprise := cr.Spec.ForProvider.Enterprise
 	costCenterID := cr.Status.AtProvider.ID
 
 	if enterprise == nil || costCenterID == nil {
+		log.Info("No enterprise or cost center ID provided, skipping deletion")
 		return nil // Nothing to delete
 	}
 
+	log.Info("Deleting cost center from GitHub", "enterprise", *enterprise, "costCenterID", *costCenterID)
+
 	err := c.service.DeleteCostCenter(ctx, *enterprise, *costCenterID)
-	if err != nil && !IsNotFound(err) {
-		return errors.Wrap(err, errDeleteCostCenter)
+	if err != nil {
+		if IsNotFound(err) {
+			log.Info("Cost center not found in GitHub, considering deletion successful")
+			c.recorder.Event(cr, event.Normal("DeleteCompleted", "Cost center not found in GitHub (already deleted)"))
+		} else {
+			log.Error(err, "Failed to delete cost center from GitHub")
+			c.recorder.Event(cr, event.Warning("DeleteFailed", err))
+			return errors.Wrap(err, errDeleteCostCenter)
+		}
+	} else {
+		log.Info("Successfully deleted cost center from GitHub")
+		c.recorder.Event(cr, event.Normal("DeleteCompleted", "Successfully deleted cost center from GitHub"))
 	}
 
 	return nil
@@ -794,13 +832,6 @@ func isUpToDate(costCenter *CostCenter, params v1alpha1.CostCenterParameters) bo
 	desiredName := *params.Name
 	isMatch := actualName == desiredName
 
-	// This function is called frequently, so use a global logger approach
-	// since we don't have context here
-	if !isMatch {
-		// Log names for debugging name mismatch issues
-		fmt.Printf("DEBUG: Name mismatch - GitHub: '%s' vs Spec: '%s'\n", actualName, desiredName)
-	}
-
 	return isMatch
 }
 
@@ -811,4 +842,193 @@ func IsNotFound(err error) bool {
 	}
 	var notFoundErr *NotFoundError
 	return errors.As(err, &notFoundErr)
+}
+
+// DirectCostCenterReconciler bypasses the managed reconciler pattern to avoid upjet interference
+type DirectCostCenterReconciler struct {
+	client.Client
+	Scheme       *runtime.Scheme
+	Logger       logging.Logger
+	newServiceFn func(ctx context.Context, token string, baseURL string) GitHubService
+	recorder     event.Recorder
+}
+
+func (r *DirectCostCenterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := r.Logger.WithValues("function", "DirectCostCenterReconciler.Reconcile", "resource", req.Name)
+	log.Info("DIRECT CONTROLLER: Starting reconciliation")
+
+	// Get the CostCenter resource
+	var costCenter v1alpha1.CostCenter
+	if err := r.Get(ctx, req.NamespacedName, &costCenter); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			log.Info("CostCenter resource not found, probably deleted")
+			return ctrl.Result{}, nil
+		}
+		log.Info("Failed to get CostCenter resource", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	log.Info("DIRECT CONTROLLER: Found CostCenter resource",
+		"name", costCenter.Spec.ForProvider.Name,
+		"enterprise", costCenter.Spec.ForProvider.Enterprise,
+		"deletionTimestamp", costCenter.GetDeletionTimestamp())
+
+	// Check if the resource is being deleted
+	if costCenter.GetDeletionTimestamp() != nil {
+		log.Info("DIRECT CONTROLLER: Resource is being deleted, handling deletion")
+		return r.handleDeletion(ctx, &costCenter)
+	}
+
+	// Get external client
+	externalClient, err := r.getExternalClient(ctx, &costCenter)
+	if err != nil {
+		log.Info("Failed to create external client", "error", err)
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	log.Info("DIRECT CONTROLLER: Successfully created external client")
+
+	// Use the external client to observe the resource
+	observation, err := externalClient.Observe(ctx, &costCenter)
+	if err != nil {
+		log.Info("Failed to observe external resource", "error", err)
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	log.Info("DIRECT CONTROLLER: Observed external resource",
+		"exists", observation.ResourceExists,
+		"upToDate", observation.ResourceUpToDate)
+
+	// Handle the resource based on its state
+	if !observation.ResourceExists {
+		// Create the resource
+		log.Info("DIRECT CONTROLLER: Creating external resource")
+		_, err := externalClient.Create(ctx, &costCenter)
+		if err != nil {
+			log.Info("Failed to create external resource", "error", err)
+			return ctrl.Result{RequeueAfter: time.Minute}, err
+		}
+		log.Info("DIRECT CONTROLLER: Successfully created external resource")
+	} else if !observation.ResourceUpToDate {
+		// Update the resource
+		log.Info("DIRECT CONTROLLER: Updating external resource")
+		_, err := externalClient.Update(ctx, &costCenter)
+		if err != nil {
+			log.Info("Failed to update external resource", "error", err)
+			return ctrl.Result{RequeueAfter: time.Minute}, err
+		}
+		log.Info("DIRECT CONTROLLER: Successfully updated external resource")
+	}
+
+	// Update the status to Ready and Synced
+	costCenter.Status.SetConditions(xpv1.Available())
+	if observation.ResourceUpToDate {
+		costCenter.Status.SetConditions(xpv1.Available().WithMessage("Resource is up to date"))
+	}
+
+	// Set Synced condition - true if resource exists and is up to date
+	if observation.ResourceExists {
+		if observation.ResourceUpToDate {
+			costCenter.Status.SetConditions(xpv1.ReconcileSuccess())
+		} else {
+			costCenter.Status.SetConditions(xpv1.ReconcileError(errors.New("resource exists but is not up to date")))
+		}
+	} else {
+		costCenter.Status.SetConditions(xpv1.ReconcileError(errors.New("resource does not exist yet")))
+	}
+
+	if err := r.Status().Update(ctx, &costCenter); err != nil {
+		log.Info("Failed to update status", "error", err)
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	log.Info("DIRECT CONTROLLER: Successfully set Ready and Synced conditions")
+	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
+}
+
+func (r *DirectCostCenterReconciler) handleDeletion(ctx context.Context, costCenter *v1alpha1.CostCenter) (ctrl.Result, error) {
+	log := r.Logger.WithValues("function", "handleDeletion", "resource", costCenter.Name)
+	log.Info("DIRECT CONTROLLER: Handling resource deletion")
+
+	// Get external client to perform deletion
+	externalClient, err := r.getExternalClient(ctx, costCenter)
+	if err != nil {
+		log.Info("Failed to create external client for deletion", "error", err)
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	// Call the Delete method from our external client
+	log.Info("DIRECT CONTROLLER: Calling external client Delete method")
+	err = externalClient.Delete(ctx, costCenter)
+	if err != nil {
+		log.Info("Failed to delete external resource", "error", err)
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	log.Info("DIRECT CONTROLLER: Successfully deleted external resource")
+
+	// Remove the finalizer to allow Kubernetes to delete the resource
+	finalizers := costCenter.GetFinalizers()
+	var newFinalizers []string
+	for _, finalizer := range finalizers {
+		if finalizer != "finalizer.managedresource.crossplane.io" {
+			newFinalizers = append(newFinalizers, finalizer)
+		}
+	}
+	costCenter.SetFinalizers(newFinalizers)
+
+	// Update the resource to remove the finalizer
+	if err := r.Update(ctx, costCenter); err != nil {
+		log.Info("Failed to remove finalizer", "error", err)
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	log.Info("DIRECT CONTROLLER: Successfully removed finalizer, resource can now be deleted")
+	return ctrl.Result{}, nil
+}
+
+func (r *DirectCostCenterReconciler) getExternalClient(ctx context.Context, cr *v1alpha1.CostCenter) (*external, error) {
+	log := r.Logger.WithValues("function", "getExternalClient")
+	log.Info("Creating external client for cost center")
+
+	// Get provider config
+	pc := &apisv1beta1.ProviderConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cr.GetProviderConfigReference().Name}, pc); err != nil {
+		return nil, errors.Wrap(err, errGetPC)
+	}
+
+	// Extract credentials
+	cd := pc.Spec.Credentials
+	data, err := resource.CommonCredentialExtractor(ctx, cd.Source, r.Client, cd.CommonCredentialSelectors)
+	if err != nil {
+		return nil, errors.Wrap(err, errGetCreds)
+	}
+
+	// Parse credentials
+	type githubCreds struct {
+		Token   *string `json:"token,omitempty"`
+		BaseURL *string `json:"base_url,omitempty"`
+	}
+
+	var creds githubCreds
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return nil, errors.Wrap(err, "failed to parse GitHub credentials JSON")
+	}
+
+	token := ""
+	if creds.Token != nil {
+		token = *creds.Token
+	}
+
+	if token == "" {
+		return nil, errors.New("GitHub token is required but not provided in credentials")
+	}
+
+	baseURL := "https://api.github.com"
+	if creds.BaseURL != nil && *creds.BaseURL != "" {
+		baseURL = *creds.BaseURL
+	}
+
+	svc := r.newServiceFn(ctx, token, baseURL)
+	return &external{service: svc, recorder: r.recorder}, nil
 }
