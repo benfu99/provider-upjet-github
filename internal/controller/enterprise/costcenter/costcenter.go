@@ -397,12 +397,25 @@ func (r *DirectCostCenterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return r.handleDeletion(ctx, &costCenter)
 	}
 
-	// Add finalizer if it doesn't exist
+	// Handle finalizer management
+	result, err := r.ensureFinalizer(ctx, &costCenter)
+	if err != nil || result.Requeue {
+		return result, err
+	}
+
+	// Handle resource reconciliation
+	return r.reconcileResource(ctx, req, &costCenter)
+}
+
+// ensureFinalizer adds the finalizer if it doesn't exist
+func (r *DirectCostCenterReconciler) ensureFinalizer(ctx context.Context, costCenter *v1alpha1.CostCenter) (ctrl.Result, error) {
+	log := r.Logger.WithValues("function", "ensureFinalizer")
+
 	const finalizer = "finalizer.managedresource.crossplane.io"
 	if !containsFinalizer(costCenter.GetFinalizers(), finalizer) {
 		log.Info("DIRECT CONTROLLER: Adding finalizer")
 		costCenter.SetFinalizers(append(costCenter.GetFinalizers(), finalizer))
-		if err := r.Update(ctx, &costCenter); err != nil {
+		if err := r.Update(ctx, costCenter); err != nil {
 			log.Info("Failed to add finalizer", "error", err)
 			return ctrl.Result{}, err
 		}
@@ -410,8 +423,15 @@ func (r *DirectCostCenterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	return ctrl.Result{}, nil
+}
+
+// reconcileResource handles the main reconciliation logic
+func (r *DirectCostCenterReconciler) reconcileResource(ctx context.Context, req ctrl.Request, costCenter *v1alpha1.CostCenter) (ctrl.Result, error) {
+	log := r.Logger.WithValues("function", "reconcileResource")
+
 	// Get external client
-	externalClient, err := r.getExternalClient(ctx, &costCenter)
+	externalClient, err := r.getExternalClient(ctx, costCenter)
 	if err != nil {
 		log.Info("Failed to create external client", "error", err)
 		return ctrl.Result{RequeueAfter: time.Minute}, err
@@ -419,43 +439,83 @@ func (r *DirectCostCenterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	log.Info("DIRECT CONTROLLER: Successfully created external client")
 
+	// Refresh resource state and observe
+	observation, err := r.observeResource(ctx, req, externalClient)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	// Handle resource based on observation
+	err = r.handleResourceState(ctx, externalClient, costCenter, observation)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	// Update status and metadata
+	err = r.updateResourceStatus(ctx, req, externalClient, costCenter, observation)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: time.Minute}, err
+	}
+
+	log.Info("DIRECT CONTROLLER: Successfully set Ready and Synced conditions")
+	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
+}
+
+// observeResource fetches the latest resource state and observes it
+func (r *DirectCostCenterReconciler) observeResource(ctx context.Context, req ctrl.Request, externalClient *external) (ExternalObservation, error) {
+	log := r.Logger.WithValues("function", "observeResource")
+
 	// Fetch the latest resource state to ensure we have current status
+	var costCenter v1alpha1.CostCenter
 	if err := r.Get(ctx, req.NamespacedName, &costCenter); err != nil {
 		log.Info("Failed to get latest CostCenter resource", "error", err)
-		return ctrl.Result{RequeueAfter: time.Minute}, err
+		return ExternalObservation{}, err
 	}
 
 	// Use the external client to observe the resource
 	observation, err := externalClient.Observe(ctx, &costCenter)
 	if err != nil {
 		log.Info("Failed to observe external resource", "error", err)
-		return ctrl.Result{RequeueAfter: time.Minute}, err
+		return ExternalObservation{}, err
 	}
 
 	log.Info("DIRECT CONTROLLER: Observed external resource",
 		"exists", observation.ResourceExists,
 		"upToDate", observation.ResourceUpToDate)
 
-	// Handle the resource based on its state
+	return observation, nil
+}
+
+// handleResourceState creates or updates the resource based on observation
+func (r *DirectCostCenterReconciler) handleResourceState(ctx context.Context, externalClient *external, costCenter *v1alpha1.CostCenter, observation ExternalObservation) error {
+	log := r.Logger.WithValues("function", "handleResourceState")
+
 	if !observation.ResourceExists {
 		// Create the resource
 		log.Info("DIRECT CONTROLLER: Creating external resource")
-		_, err := externalClient.Create(ctx, &costCenter)
+		_, err := externalClient.Create(ctx, costCenter)
 		if err != nil {
 			log.Info("Failed to create external resource", "error", err)
-			return ctrl.Result{RequeueAfter: time.Minute}, err
+			return err
 		}
 		log.Info("DIRECT CONTROLLER: Successfully created external resource")
 	} else if !observation.ResourceUpToDate {
 		// Update the resource
 		log.Info("DIRECT CONTROLLER: Updating external resource")
-		_, err := externalClient.Update(ctx, &costCenter)
+		_, err := externalClient.Update(ctx, costCenter)
 		if err != nil {
 			log.Info("Failed to update external resource", "error", err)
-			return ctrl.Result{RequeueAfter: time.Minute}, err
+			return err
 		}
 		log.Info("DIRECT CONTROLLER: Successfully updated external resource")
 	}
+
+	return nil
+}
+
+// updateResourceStatus updates the Kubernetes resource status and metadata
+func (r *DirectCostCenterReconciler) updateResourceStatus(ctx context.Context, req ctrl.Request, externalClient *external, costCenter *v1alpha1.CostCenter, observation ExternalObservation) error {
+	log := r.Logger.WithValues("function", "updateResourceStatus")
 
 	// Update the status to Ready and Synced
 	costCenter.Status.SetConditions(xpv1.Available())
@@ -475,33 +535,32 @@ func (r *DirectCostCenterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// First update the status
-	if err := r.Status().Update(ctx, &costCenter); err != nil {
+	if err := r.Status().Update(ctx, costCenter); err != nil {
 		log.Info("Failed to update status", "error", err)
-		return ctrl.Result{RequeueAfter: time.Minute}, err
+		return err
 	}
 
 	// Fetch the resource again to get the latest version after status update
 	var latestCostCenter v1alpha1.CostCenter
 	if err := r.Get(ctx, req.NamespacedName, &latestCostCenter); err != nil {
 		log.Info("Failed to get latest CostCenter resource for metadata update", "error", err)
-		return ctrl.Result{RequeueAfter: time.Minute}, err
+		return err
 	}
 
 	// Re-run observe to set the ExternalName annotation on the fresh resource
-	_, err = externalClient.Observe(ctx, &latestCostCenter)
+	_, err := externalClient.Observe(ctx, &latestCostCenter)
 	if err != nil {
 		log.Info("Failed to re-observe for ExternalName setting", "error", err)
-		return ctrl.Result{RequeueAfter: time.Minute}, err
+		return err
 	}
 
 	// Now update the resource metadata/spec (to persist ExternalName annotation)
 	if err := r.Update(ctx, &latestCostCenter); err != nil {
 		log.Info("Failed to update resource metadata", "error", err)
-		return ctrl.Result{RequeueAfter: time.Minute}, err
+		return err
 	}
 
-	log.Info("DIRECT CONTROLLER: Successfully set Ready and Synced conditions")
-	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
+	return nil
 }
 
 func (r *DirectCostCenterReconciler) handleDeletion(ctx context.Context, costCenter *v1alpha1.CostCenter) (ctrl.Result, error) {

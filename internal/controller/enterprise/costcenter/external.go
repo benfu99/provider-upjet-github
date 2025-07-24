@@ -48,28 +48,8 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (ExternalOb
 		return ExternalObservation{}, errors.Wrap(err, "failed to list cost centers")
 	}
 
-	// Look for the cost center by ID first (if we have one), then by name
-	var targetCostCenter *CostCenter
-
-	if cr.Status.AtProvider.ID != nil {
-		// Search by ID
-		for _, cc := range costCenters {
-			if cc.ID != nil && *cc.ID == *cr.Status.AtProvider.ID {
-				targetCostCenter = &cc
-				break
-			}
-		}
-	}
-
-	// If not found by ID, search by name
-	if targetCostCenter == nil {
-		for _, cc := range costCenters {
-			if cc.Name != nil && *cc.Name == *cr.Spec.ForProvider.Name {
-				targetCostCenter = &cc
-				break
-			}
-		}
-	}
+	// Find the target cost center
+	targetCostCenter := e.findTargetCostCenter(costCenters, cr)
 
 	// If no cost center found
 	if targetCostCenter == nil {
@@ -93,6 +73,45 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (ExternalOb
 		ResourceExists:   true,
 		ResourceUpToDate: e.isUpToDate(targetCostCenter, cr.Spec.ForProvider),
 	}, nil
+}
+
+// findTargetCostCenter searches for the cost center by ID first, then by name
+func (e *external) findTargetCostCenter(costCenters []CostCenter, cr *v1alpha1.CostCenter) *CostCenter {
+	// Look for the cost center by ID first (if we have one), then by name
+	var targetCostCenter *CostCenter
+
+	if cr.Status.AtProvider.ID != nil {
+		targetCostCenter = e.findCostCenterByID(costCenters, *cr.Status.AtProvider.ID)
+	}
+
+	// If not found by ID, search by name
+	if targetCostCenter == nil {
+		targetCostCenter = e.findCostCenterByName(costCenters, *cr.Spec.ForProvider.Name)
+	}
+
+	return targetCostCenter
+}
+
+// findCostCenterByID searches for a cost center by its ID
+func (e *external) findCostCenterByID(costCenters []CostCenter, id string) *CostCenter {
+	for i := range costCenters {
+		cc := &costCenters[i]
+		if cc.ID != nil && *cc.ID == id {
+			return cc
+		}
+	}
+	return nil
+}
+
+// findCostCenterByName searches for a cost center by its name
+func (e *external) findCostCenterByName(costCenters []CostCenter, name string) *CostCenter {
+	for i := range costCenters {
+		cc := &costCenters[i]
+		if cc.Name != nil && *cc.Name == name {
+			return cc
+		}
+	}
+	return nil
 }
 
 func (e *external) Create(ctx context.Context, mg resource.Managed) (ExternalCreation, error) {
@@ -204,12 +223,4 @@ func (e *external) isResourceActive(costCenter *CostCenter) bool {
 	}
 	// Cost center is active if it's not in "deleted" state
 	return *costCenter.State != "deleted"
-}
-
-// isNotFoundError checks if an error is a 404 not found error
-func isNotFoundError(err error) bool {
-	if _, ok := err.(*NotFoundError); ok {
-		return true
-	}
-	return false
 }
