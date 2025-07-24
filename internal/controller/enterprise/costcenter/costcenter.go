@@ -46,8 +46,6 @@ const (
 func Setup(mgr ctrl.Manager, o controller.Options) error {
 	name := "costcenter-direct"
 
-	o.Logger.Info("Setting up CostCenter controller", "name", name)
-
 	// Use DirectCostCenterReconciler which has working deletion functionality
 	reconciler := &DirectCostCenterReconciler{
 		Client:       mgr.GetClient(),
@@ -67,7 +65,6 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		return err
 	}
 
-	o.Logger.Info("Successfully setup CostCenter controller", "name", name)
 	return nil
 }
 
@@ -126,10 +123,6 @@ func (s *gitHubService) makeRequest(ctx context.Context, method, path string, bo
 
 	url := fmt.Sprintf("%s/%s", strings.TrimRight(s.baseURL, "/"), path)
 
-	// Get logger from context
-	log := ctrl.LoggerFrom(ctx)
-	log.V(1).Info("Making HTTP request", "method", method, "url", url)
-
 	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
@@ -148,7 +141,6 @@ func (s *gitHubService) makeRequest(ctx context.Context, method, path string, bo
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 
-	log.V(1).Info("HTTP response received", "status", resp.StatusCode)
 	return resp, nil
 }
 
@@ -207,10 +199,6 @@ func (s *gitHubService) GetCostCenter(ctx context.Context, enterprise, costCente
 		return nil, fmt.Errorf("GitHub API error: %d %s - Response: %s", resp.StatusCode, resp.Status, string(bodyBytes))
 	}
 
-	// Log response for debugging
-	log := ctrl.LoggerFrom(ctx)
-	log.V(1).Info("GetCostCenter response received", "responseBody", string(bodyBytes))
-
 	// The API returns a single object (not an array)
 	var costCenter CostCenter
 	if err := json.Unmarshal(bodyBytes, &costCenter); err != nil {
@@ -239,10 +227,6 @@ func (s *gitHubService) ListCostCenters(ctx context.Context, enterprise string) 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API error: %d %s - Response: %s", resp.StatusCode, resp.Status, string(bodyBytes))
 	}
-
-	// Log response for debugging
-	log := ctrl.LoggerFrom(ctx)
-	log.V(1).Info("ListCostCenters response received", "responseBody", string(bodyBytes))
 
 	// The API returns a wrapper object with a "costCenters" field
 	type ListResponse struct {
@@ -284,10 +268,6 @@ func (s *gitHubService) UpdateCostCenter(ctx context.Context, enterprise, costCe
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Log response for debugging
-	log := ctrl.LoggerFrom(ctx)
-	log.V(1).Info("UpdateCostCenter response received", "responseBody", string(bodyBytes))
-
 	// The API returns an array with one element
 	var costCenters []CostCenter
 	if err := json.Unmarshal(bodyBytes, &costCenters); err != nil {
@@ -304,38 +284,28 @@ func (s *gitHubService) UpdateCostCenter(ctx context.Context, enterprise, costCe
 func (s *gitHubService) DeleteCostCenter(ctx context.Context, enterprise, costCenterID string) error {
 	path := fmt.Sprintf("enterprises/%s/settings/billing/cost-centers/%s", enterprise, costCenterID)
 
-	log := ctrl.LoggerFrom(ctx)
-	log.Info("Making DELETE request to GitHub API", "enterprise", enterprise, "costCenterID", costCenterID, "path", path)
-
 	resp, err := s.makeRequest(ctx, "DELETE", path, nil)
 	if err != nil {
-		log.Error(err, "Failed to make DELETE request to GitHub API")
 		return fmt.Errorf("failed to delete cost center: %w", err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
 
-	log.Info("DELETE request completed", "statusCode", resp.StatusCode)
-
 	// Read response body for debugging
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		bodyBytes = []byte("failed to read response body")
 	}
-	log.V(1).Info("DELETE response body", "responseBody", string(bodyBytes))
 
 	if resp.StatusCode == http.StatusNotFound {
-		log.Info("Cost center not found (404), treating as successfully deleted")
 		return &NotFoundError{Message: "cost center not found"}
 	}
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		log.Error(nil, "GitHub API returned error status", "statusCode", resp.StatusCode, "responseBody", string(bodyBytes))
 		return fmt.Errorf("GitHub API error: %d - Response: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	log.Info("Successfully deleted cost center from GitHub")
 	return nil
 }
 
@@ -374,29 +344,18 @@ type DirectCostCenterReconciler struct {
 // It manages the full lifecycle including creation, updates, deletion, and status synchronization
 // with the GitHub Enterprise Cost Centers API.
 func (r *DirectCostCenterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.Logger.WithValues("function", "DirectCostCenterReconciler.Reconcile", "resource", req.Name)
-	log.Info("DIRECT CONTROLLER: Starting reconciliation")
-
 	// Get the CostCenter resource
 	var costCenter v1alpha1.CostCenter
 	if err := r.Get(ctx, req.NamespacedName, &costCenter); err != nil {
 		if client.IgnoreNotFound(err) == nil {
-			log.Info("CostCenter resource not found, probably deleted")
 			return ctrl.Result{}, nil
 		}
-		log.Info("Failed to get CostCenter resource", "error", err)
+		r.Logger.Info("Failed to get CostCenter resource", "error", err)
 		return ctrl.Result{}, err
 	}
 
-	log.Info("DIRECT CONTROLLER: Found CostCenter resource",
-		"name", costCenter.Spec.ForProvider.Name,
-		"enterprise", costCenter.Spec.ForProvider.Enterprise,
-		"deletionTimestamp", costCenter.GetDeletionTimestamp(),
-		"finalizers", costCenter.GetFinalizers())
-
 	// Check if the resource is being deleted
 	if costCenter.GetDeletionTimestamp() != nil {
-		log.Info("DIRECT CONTROLLER: Resource is being deleted, handling deletion")
 		return r.handleDeletion(ctx, &costCenter)
 	}
 
@@ -412,17 +371,15 @@ func (r *DirectCostCenterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 // ensureFinalizer adds the finalizer if it doesn't exist
 func (r *DirectCostCenterReconciler) ensureFinalizer(ctx context.Context, costCenter *v1alpha1.CostCenter) (ctrl.Result, error) {
-	log := r.Logger.WithValues("function", "ensureFinalizer")
-
 	const finalizer = "finalizer.managedresource.crossplane.io"
 	if !containsFinalizer(costCenter.GetFinalizers(), finalizer) {
-		log.Info("DIRECT CONTROLLER: Adding finalizer")
 		costCenter.SetFinalizers(append(costCenter.GetFinalizers(), finalizer))
 		if err := r.Update(ctx, costCenter); err != nil {
-			log.Info("Failed to add finalizer", "error", err)
+			r.Logger.Info("Failed to add finalizer", "error", err)
+			r.recorder.Event(costCenter, event.Warning("FinalizerError", err))
 			return ctrl.Result{}, err
 		}
-		log.Info("DIRECT CONTROLLER: Successfully added finalizer, requeuing")
+		r.recorder.Event(costCenter, event.Normal("FinalizerAdded", "Successfully added finalizer"))
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -431,86 +388,84 @@ func (r *DirectCostCenterReconciler) ensureFinalizer(ctx context.Context, costCe
 
 // reconcileResource handles the main reconciliation logic
 func (r *DirectCostCenterReconciler) reconcileResource(ctx context.Context, req ctrl.Request, costCenter *v1alpha1.CostCenter) (ctrl.Result, error) {
-	log := r.Logger.WithValues("function", "reconcileResource")
-
 	// Get external client
 	externalClient, err := r.getExternalClient(ctx, costCenter)
 	if err != nil {
-		log.Info("Failed to create external client", "error", err)
+		r.Logger.Info("Failed to create external client", "error", err)
+		r.recorder.Event(costCenter, event.Warning("ClientError", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
-
-	log.Info("DIRECT CONTROLLER: Successfully created external client")
 
 	// Refresh resource state and observe
 	observation, err := r.observeResource(ctx, req, externalClient)
 	if err != nil {
+		r.recorder.Event(costCenter, event.Warning("ObservationError", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 
 	// Handle resource based on observation
 	err = r.handleResourceState(ctx, externalClient, costCenter, observation)
 	if err != nil {
+		r.recorder.Event(costCenter, event.Warning("ResourceStateError", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 
 	// Update status and metadata
 	err = r.updateResourceStatus(ctx, req, externalClient, costCenter, observation)
 	if err != nil {
+		r.recorder.Event(costCenter, event.Warning("StatusUpdateError", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 
-	log.Info("DIRECT CONTROLLER: Successfully set Ready and Synced conditions")
+	// Record successful reconciliation
+	if observation.ResourceExists {
+		if observation.ResourceUpToDate {
+			r.recorder.Event(costCenter, event.Normal("Synced", "Cost center is up to date"))
+		} else {
+			r.recorder.Event(costCenter, event.Normal("Updated", "Cost center has been updated"))
+		}
+	} else {
+		r.recorder.Event(costCenter, event.Normal("Created", "Cost center has been created"))
+	}
+
 	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
 }
 
 // observeResource fetches the latest resource state and observes it
 func (r *DirectCostCenterReconciler) observeResource(ctx context.Context, req ctrl.Request, externalClient *external) (ExternalObservation, error) {
-	log := r.Logger.WithValues("function", "observeResource")
-
 	// Fetch the latest resource state to ensure we have current status
 	var costCenter v1alpha1.CostCenter
 	if err := r.Get(ctx, req.NamespacedName, &costCenter); err != nil {
-		log.Info("Failed to get latest CostCenter resource", "error", err)
+		r.Logger.Info("Failed to get latest CostCenter resource", "error", err)
 		return ExternalObservation{}, err
 	}
 
 	// Use the external client to observe the resource
 	observation, err := externalClient.Observe(ctx, &costCenter)
 	if err != nil {
-		log.Info("Failed to observe external resource", "error", err)
+		r.Logger.Info("Failed to observe external resource", "error", err)
 		return ExternalObservation{}, err
 	}
-
-	log.Info("DIRECT CONTROLLER: Observed external resource",
-		"exists", observation.ResourceExists,
-		"upToDate", observation.ResourceUpToDate)
 
 	return observation, nil
 }
 
 // handleResourceState creates or updates the resource based on observation
 func (r *DirectCostCenterReconciler) handleResourceState(ctx context.Context, externalClient *external, costCenter *v1alpha1.CostCenter, observation ExternalObservation) error {
-	log := r.Logger.WithValues("function", "handleResourceState")
-
 	if !observation.ResourceExists {
 		// Create the resource
-		log.Info("DIRECT CONTROLLER: Creating external resource")
 		_, err := externalClient.Create(ctx, costCenter)
 		if err != nil {
-			log.Info("Failed to create external resource", "error", err)
+			r.Logger.Info("Failed to create external resource", "error", err)
 			return err
 		}
-		log.Info("DIRECT CONTROLLER: Successfully created external resource")
 	} else if !observation.ResourceUpToDate {
 		// Update the resource
-		log.Info("DIRECT CONTROLLER: Updating external resource")
 		_, err := externalClient.Update(ctx, costCenter)
 		if err != nil {
-			log.Info("Failed to update external resource", "error", err)
+			r.Logger.Info("Failed to update external resource", "error", err)
 			return err
 		}
-		log.Info("DIRECT CONTROLLER: Successfully updated external resource")
 	}
 
 	return nil
@@ -518,8 +473,6 @@ func (r *DirectCostCenterReconciler) handleResourceState(ctx context.Context, ex
 
 // updateResourceStatus updates the Kubernetes resource status and metadata
 func (r *DirectCostCenterReconciler) updateResourceStatus(ctx context.Context, req ctrl.Request, externalClient *external, costCenter *v1alpha1.CostCenter, observation ExternalObservation) error {
-	log := r.Logger.WithValues("function", "updateResourceStatus")
-
 	// Update the status to Ready and Synced
 	costCenter.Status.SetConditions(xpv1.Available())
 	if observation.ResourceUpToDate {
@@ -539,27 +492,27 @@ func (r *DirectCostCenterReconciler) updateResourceStatus(ctx context.Context, r
 
 	// First update the status
 	if err := r.Status().Update(ctx, costCenter); err != nil {
-		log.Info("Failed to update status", "error", err)
+		r.Logger.Info("Failed to update status", "error", err)
 		return err
 	}
 
 	// Fetch the resource again to get the latest version after status update
 	var latestCostCenter v1alpha1.CostCenter
 	if err := r.Get(ctx, req.NamespacedName, &latestCostCenter); err != nil {
-		log.Info("Failed to get latest CostCenter resource for metadata update", "error", err)
+		r.Logger.Info("Failed to get latest CostCenter resource for metadata update", "error", err)
 		return err
 	}
 
 	// Re-run observe to set the ExternalName annotation on the fresh resource
 	_, err := externalClient.Observe(ctx, &latestCostCenter)
 	if err != nil {
-		log.Info("Failed to re-observe for ExternalName setting", "error", err)
+		r.Logger.Info("Failed to re-observe for ExternalName setting", "error", err)
 		return err
 	}
 
 	// Now update the resource metadata/spec (to persist ExternalName annotation)
 	if err := r.Update(ctx, &latestCostCenter); err != nil {
-		log.Info("Failed to update resource metadata", "error", err)
+		r.Logger.Info("Failed to update resource metadata", "error", err)
 		return err
 	}
 
@@ -567,31 +520,28 @@ func (r *DirectCostCenterReconciler) updateResourceStatus(ctx context.Context, r
 }
 
 func (r *DirectCostCenterReconciler) handleDeletion(ctx context.Context, costCenter *v1alpha1.CostCenter) (ctrl.Result, error) {
-	log := r.Logger.WithValues("function", "handleDeletion", "resource", costCenter.Name)
-	log.Info("DIRECT CONTROLLER: Handling resource deletion")
-
 	const finalizer = "finalizer.managedresource.crossplane.io"
 
 	// Check if we have the finalizer
 	if !containsFinalizer(costCenter.GetFinalizers(), finalizer) {
-		log.Info("DIRECT CONTROLLER: No finalizer present, deletion already handled")
 		return ctrl.Result{}, nil
 	}
 
 	// Get external client to perform deletion
 	externalClient, err := r.getExternalClient(ctx, costCenter)
 	if err != nil {
-		log.Info("Failed to create external client for deletion", "error", err)
+		r.Logger.Info("Failed to create external client for deletion", "error", err)
+		r.recorder.Event(costCenter, event.Warning("DeletionClientError", err))
 		// Continue with finalizer removal to avoid stuck resources
 	} else {
 		// Call the Delete method from our external client
-		log.Info("DIRECT CONTROLLER: Calling external client Delete method")
 		err = externalClient.Delete(ctx, costCenter)
 		if err != nil {
-			log.Info("Failed to delete external resource", "error", err)
+			r.Logger.Info("Failed to delete external resource", "error", err)
+			r.recorder.Event(costCenter, event.Warning("DeletionError", err))
 			return ctrl.Result{RequeueAfter: time.Minute}, err
 		}
-		log.Info("DIRECT CONTROLLER: Successfully deleted external resource")
+		r.recorder.Event(costCenter, event.Normal("Deleted", "Cost center has been deleted from GitHub"))
 	}
 
 	// Remove the finalizer to allow Kubernetes to delete the resource
@@ -606,18 +556,16 @@ func (r *DirectCostCenterReconciler) handleDeletion(ctx context.Context, costCen
 
 	// Update the resource to remove the finalizer
 	if err := r.Update(ctx, costCenter); err != nil {
-		log.Info("Failed to remove finalizer", "error", err)
+		r.Logger.Info("Failed to remove finalizer", "error", err)
+		r.recorder.Event(costCenter, event.Warning("FinalizerRemovalError", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 
-	log.Info("DIRECT CONTROLLER: Successfully removed finalizer, resource can now be deleted")
+	r.recorder.Event(costCenter, event.Normal("FinalizerRemoved", "Successfully removed finalizer"))
 	return ctrl.Result{}, nil
 }
 
 func (r *DirectCostCenterReconciler) getExternalClient(ctx context.Context, cr *v1alpha1.CostCenter) (*external, error) {
-	log := r.Logger.WithValues("function", "getExternalClient")
-	log.Info("Creating external client for cost center")
-
 	// Get provider config
 	pc := &apisv1beta1.ProviderConfig{}
 	if err := r.Get(ctx, types.NamespacedName{Name: cr.GetProviderConfigReference().Name}, pc); err != nil {
