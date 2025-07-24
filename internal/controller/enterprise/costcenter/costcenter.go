@@ -370,6 +370,9 @@ type DirectCostCenterReconciler struct {
 	recorder     event.Recorder
 }
 
+// Reconcile handles the reconciliation loop for CostCenter resources.
+// It manages the full lifecycle including creation, updates, deletion, and status synchronization
+// with the GitHub Enterprise Cost Centers API.
 func (r *DirectCostCenterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Logger.WithValues("function", "DirectCostCenterReconciler.Reconcile", "resource", req.Name)
 	log.Info("DIRECT CONTROLLER: Starting reconciliation")
